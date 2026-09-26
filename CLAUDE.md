@@ -63,7 +63,7 @@ src/
 │   ├── pvc.py                #   PVC disk usage via Prometheus
 │   ├── certificate.py        #   cert-manager certificate expiry
 │   ├── endpoint.py           #   HTTP endpoint health checks
-│   ├── backup.py             #   CNPG, CronJob, Percona backup checks
+│   ├── backup.py             #   CNPG and CronJob (pg_dump) backup checks
 │   ├── critical_endpoint.py  #   Traefik IngressRoute chain probing
 │   ├── storage_verify.py     #   S3/GCS backup storage verification
 │   └── _probe.py             #   HTTP probe helpers
@@ -236,13 +236,13 @@ Auth: `X-Internal-Token` header matching `INTERNAL_TOKEN` env var.
 | `BACKUP_MAX_AGE_HOURS` | `26` | Max backup age before alerting |
 | `BACKUP_STORAGE_PROVIDER` | _(empty)_ | `s3`, `gcs`, or empty (disabled) |
 | `BACKUP_STORAGE_VERIFY_HOUR_UTC` | `7` | Hour (UTC) for daily storage check |
-| `BACKUP_STORAGE_DOWNLOAD_VERIFY` | `false` | Deep integrity validation (gzip, pg_dump, BSON) |
+| `BACKUP_STORAGE_DOWNLOAD_VERIFY` | `false` | Deep integrity validation (gzip, pg_dump) |
 | `BACKUP_STORAGE_VERIFY_BYTES` | `1048576` | Bytes to download for integrity check (1MB) |
 | `BACKUP_STORAGE_MIN_SIZE_BYTES` | `1024` | Minimum backup file size |
 | `BACKUP_SIZE_DROP_THRESHOLD` | `0.5` | Size drop ratio vs yesterday triggering warning |
 | `BACKUP_S3_SECRET_NAME` | `s3-backup-credentials` | K8s secret with S3 creds |
 | `BACKUP_S3_SECRET_NAMESPACE` | _(auto)_ | Namespace of S3 secret |
-| `BACKUP_STORAGE_S3_DUMP_PREFIXES` | `postgres-dump,mongodb-dump` | S3 prefix paths to scan |
+| `BACKUP_STORAGE_S3_DUMP_PREFIXES` | `postgres-dump` | S3 prefix paths to scan |
 
 ### Thresholds
 | Variable | Default | Description |
@@ -414,6 +414,7 @@ All tools handle missing data sources gracefully. If ES/Uptrace/Prometheus is no
 ### Security Rules
 
 - Never hardcode API keys, tokens, or credentials — all secrets come from env vars or K8s secrets
+- No access to Kubernetes Secrets: the ClusterRole grants none - listing or reading a Secret returns its contents. Take what you need from other objects (CronJob names, cert-manager Certificate status, events). The only exception is the opt-in S3 storage check (one Secret, namespaced Role with resourceNames)
 - Use `sanitizer.py` patterns for any new context that might contain sensitive data
 - SQL queries in `store/sqlite.py` must use parameterized queries only — never string interpolation
 - All datetimes must be timezone-aware (UTC) — never use naive datetimes

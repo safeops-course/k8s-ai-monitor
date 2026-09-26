@@ -492,17 +492,9 @@ def _collect_ingress_context(
             secret = tls.get("secretName", "")
             if secret:
                 lines.append(f"  TLS Secret: {secret}")
-                # Check if TLS secret exists
-                try:
-                    s = core.read_namespaced_secret(secret, ns)
-                    has_cert = "tls.crt" in (s.data or {})
-                    has_key = "tls.key" in (s.data or {})
-                    lines.append(f"    Secret status: {'exists' if has_cert and has_key else 'MISSING cert/key'}")
-                except k8s.ApiException as e:
-                    if e.status == 404:
-                        lines.append("    Secret status: NOT FOUND")
-                    else:
-                        lines.append(f"    Secret status: error ({e.reason})")
+                # Certificate state from cert-manager, not from the Secret: reading the Secret
+                # returns the private key, and the monitor has no access to Secrets by design.
+                lines.append(f"    Certificate status: {_certificate_status(ns, secret)}")
             cert_resolver = tls.get("certResolver", "")
             if cert_resolver:
                 lines.append(f"  CertResolver: {cert_resolver}")
@@ -1170,3 +1162,34 @@ class CriticalEndpointScanner:
 
     def collect_daily_data(self) -> str | None:
         return None
+
+
+def _certificate_status(ns: str, secret_name: str) -> str:
+    """Ready state of the cert-manager Certificate that writes secret_name (no Secret access).
+
+    Never raises: a failure here must not hide the rest of the IngressRoute report.
+    """
+    try:
+        certs = k8s.CustomObjectsApi().list_namespaced_custom_object("cert-manager.io", "v1", ns, "certificates")
+    except k8s.ApiException as e:
+        if e.status == 404:
+            return "unknown (cert-manager not installed)"
+        logger.warning("Failed to list cert-manager Certificates in %s: %s", ns, e.reason)
+        return f"unknown (API error: {e.reason})"
+    except Exception:
+        logger.warning("Failed to list cert-manager Certificates in %s", ns, exc_info=True)
+        return "unknown (lookup failed)"
+    try:
+        for cert in certs.get("items", []):
+            if cert.get("spec", {}).get("secretName") != secret_name:
+                continue
+            name = cert.get("metadata", {}).get("name", "?")
+            for cond in cert.get("status", {}).get("conditions", []):
+                if cond.get("type") == "Ready":
+                    ready = "ready" if cond.get("status") == "True" else "NOT READY"
+                    return f"{ready} (Certificate {name}: {cond.get('message', '')})"
+            return f"no Ready condition (Certificate {name})"
+        return "no cert-manager Certificate writes this Secret"
+    except Exception:
+        logger.warning("Unexpected Certificate data in %s for secret %s", ns, secret_name, exc_info=True)
+        return "unknown (unexpected Certificate data)"

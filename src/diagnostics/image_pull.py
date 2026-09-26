@@ -17,16 +17,10 @@ class ImagePullDiagnostic:
         pull_secrets_info = []
         pull_secrets = pod.spec.image_pull_secrets or []
         for s in pull_secrets:
-            entry = {"name": s.name}
-            try:
-                core.read_namespaced_secret(s.name, pod.metadata.namespace)
-                entry["exists"] = True
-            except k8s.ApiException as e:
-                if e.status == 404:
-                    entry["exists"] = False
-                else:
-                    entry["check_failed"] = True
-            pull_secrets_info.append(entry)
+            # Existence is not checked: reading a Secret returns its contents (registry credentials),
+            # and the monitor has no access to Secrets by design. The kubelet's pull error already
+            # says whether authentication failed.
+            pull_secrets_info.append({"name": s.name, "exists": "not checked (no Secret access by design)"})
 
         data = {"images": images}
         if pull_secrets_info:

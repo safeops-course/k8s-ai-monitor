@@ -645,7 +645,7 @@ def cmd_check_backups(args):
     min_size = config.BACKUP_STORAGE_MIN_SIZE_BYTES
 
     for ns in namespaces:
-        # Discover postgres services from db-* secrets
+        # Discover postgres services from the backup CronJobs
         pg_services = scanner._discover_postgres_services(ns)
         if pg_services:
             print(f"  [{ns}] Postgres services: {', '.join(pg_services)}")
@@ -654,21 +654,12 @@ def cmd_check_backups(args):
             total_ok += ok
             total_fail += fail
 
-        # Discover mongo services from pods with MONGO_URI
-        mongo_services = scanner._discover_mongo_services(ns)
-        if mongo_services:
-            print(f"  [{ns}] MongoDB services: {', '.join(mongo_services)}")
-        for service in mongo_services:
-            ok, fail = _check_service(client, bucket, "mongodb-dump", ns, service, today, yesterday, min_size, is_mongo=True)
-            total_ok += ok
-            total_fail += fail
-
     print(f"\nTotal: {total_ok} OK, {total_fail} failed")
     if total_fail:
         sys.exit(1)
 
 
-def _check_service(client, bucket, dump_type, ns, service, today, yesterday, min_size, is_mongo=False):
+def _check_service(client, bucket, dump_type, ns, service, today, yesterday, min_size):
     """Check a single service backup in S3. Returns (ok_count, fail_count)."""
     from src.scanners.backup import BackupScanner
     label = f"{dump_type}/{ns}/{service}"
@@ -702,7 +693,7 @@ def _check_service(client, bucket, dump_type, ns, service, today, yesterday, min
     latest = objects[0]
     age_h = (datetime.now(timezone.utc) - latest.last_modified).total_seconds() / 3600
     size_str = _fmt_size(latest.size)
-    ok = latest.size >= min_size or is_mongo
+    ok = latest.size >= min_size
     symbol = "✓" if ok else "!"
 
     # Integrity check
