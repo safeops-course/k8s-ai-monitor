@@ -116,7 +116,7 @@ BACKUP_S3_SECRET_NAMESPACE = os.environ.get("BACKUP_S3_SECRET_NAMESPACE", "")
 
 # S3: dump type prefixes to scan (comma-separated top-level dirs in bucket)
 BACKUP_STORAGE_S3_DUMP_PREFIXES = [
-    p.strip() for p in os.environ.get("BACKUP_STORAGE_S3_DUMP_PREFIXES", "postgres-dump,mongodb-dump").split(",") if p.strip()
+    p.strip() for p in os.environ.get("BACKUP_STORAGE_S3_DUMP_PREFIXES", "postgres-dump").split(",") if p.strip()
 ]
 
 # Scanner feature flags
