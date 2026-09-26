@@ -514,7 +514,7 @@ class BackupScanner:
         """Discover services from K8s and verify each has today's backup in S3.
 
         Discovery:
-        - Postgres: secrets named db-* in namespace → service = name without db- prefix
+        - Postgres: backup CronJobs postgres-backup-<service> / pg-backup-<service> → service
         - MongoDB: pods with MONGO_URI env → service = owner deployment name
 
         S3 structure: {bucket}/{dump_type}/{namespace}/{service}/{YYYY}/{MM}/{DD}/{file}
@@ -535,7 +535,7 @@ class BackupScanner:
             return []
 
         for ns in backup_namespaces:
-            # Postgres services from db-* secrets
+            # Postgres services from the backup CronJobs
             pg_services = self._discover_postgres_services(ns)
             for service in pg_services:
                 label = f"postgres-dump/{ns}/{service}"
@@ -577,22 +577,25 @@ class BackupScanner:
 
     @staticmethod
     def _discover_postgres_services(ns: str) -> list[str]:
-        """Discover postgres services from db-* secrets in a namespace."""
-        core = k8s.CoreV1Api()
-        services = []
+        """Discover postgres services from the backup CronJobs in a namespace.
+
+        postgres-backup-<service> / pg-backup-<service> -> <service>. Deliberately not from Secrets:
+        listing Secrets returns their contents, and the monitor has no access to Secrets by design.
+        """
+        batch = k8s.BatchV1Api()
+        services = set()
         try:
-            secrets = core.list_namespaced_secret(ns)
-            for s in secrets.items:
-                name = s.metadata.name
-                if name.startswith("db-") and not name.endswith("-pooler"):
-                    services.append(name[3:])  # strip "db-" prefix
+            for cj in batch.list_namespaced_cron_job(ns).items:
+                parsed = BackupScanner._parse_service_from_cronjob(cj.metadata.name)
+                if parsed and parsed[1] == "postgres-dump":
+                    services.add(parsed[0])
         except k8s.ApiException as e:
             if e.status == 404:
-                logger.debug("Secrets API not available in %s", ns)
+                logger.debug("CronJob API not available in %s", ns)
             else:
-                logger.warning("Failed to list secrets in %s for postgres discovery: %s", ns, e.reason)
+                logger.warning("Failed to list cronjobs in %s for postgres discovery: %s", ns, e.reason)
         except Exception:
-            logger.warning("Failed to list secrets in %s for postgres discovery", ns, exc_info=True)
+            logger.warning("Failed to list cronjobs in %s for postgres discovery", ns, exc_info=True)
         return sorted(services)
 
     @staticmethod

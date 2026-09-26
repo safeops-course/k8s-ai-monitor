@@ -68,7 +68,12 @@ class S3Client:
                     secret_ns = ns
                     break
                 except k8s.ApiException as e:
-                    if e.status != 404:
+                    if e.status == 403:
+                        logger.warning(
+                            "No access to secret %s in %s. The monitor has no general Secret access by design: "
+                            "set BACKUP_S3_SECRET_NAMESPACE and grant get on exactly this secret "
+                            "(Role with resourceNames: [%s]) in that namespace.", secret_name, ns, secret_name)
+                    elif e.status != 404:
                         logger.warning("Error reading secret %s in %s: %s", secret_name, ns, e.reason)
                     continue
             if not secret_ns:

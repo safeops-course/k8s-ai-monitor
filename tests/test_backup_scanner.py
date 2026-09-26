@@ -998,3 +998,57 @@ class TestAutoResolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoSecretAccess(unittest.TestCase):
+    """The monitor has no access to Secrets by design (least privilege)."""
+
+    @patch("src.scanners.backup.k8s.CoreV1Api")
+    @patch("src.scanners.backup.k8s.BatchV1Api")
+    def test_postgres_services_come_from_backup_cronjobs(self, mock_batch, mock_core):
+        mock_batch.return_value.list_namespaced_cron_job.return_value.items = [
+            _make_cronjob("postgres-backup-app"),
+            _make_cronjob("pg-backup-billing"),
+            _make_cronjob("mongo-backup-orders"),
+            _make_cronjob("cleanup-logs"),
+        ]
+        self.assertEqual(BackupScanner._discover_postgres_services("prod"), ["app", "billing"])
+        mock_core.return_value.list_namespaced_secret.assert_not_called()
+
+    def test_image_pull_diagnostic_does_not_read_secrets(self):
+        from src.diagnostics.image_pull import ImagePullDiagnostic
+
+        core = MagicMock()
+        pod = MagicMock()
+        pod.metadata.namespace = "develop"
+        pod.spec.containers = []
+        secret_ref = MagicMock()
+        secret_ref.name = "ghcr-credentials"
+        pod.spec.image_pull_secrets = [secret_ref]
+        data = ImagePullDiagnostic().diagnose(core, pod)
+        core.read_namespaced_secret.assert_not_called()
+        self.assertEqual(data["pull_secrets"][0]["name"], "ghcr-credentials")
+
+
+class TestCertificateStatusWithoutSecrets(unittest.TestCase):
+    def _certs(self, *items):
+        return {"items": list(items)}
+
+    def _cert(self, name, secret, status):
+        return {"metadata": {"name": name}, "spec": {"secretName": secret},
+                "status": {"conditions": [{"type": "Ready", "status": status, "message": "m"}]}}
+
+    @patch("src.scanners.critical_endpoint.k8s.CustomObjectsApi")
+    def test_ready_certificate(self, mock_api):
+        from src.scanners.critical_endpoint import _certificate_status
+        mock_api.return_value.list_namespaced_custom_object.return_value = self._certs(
+            self._cert("frontend", "frontend-tls", "True"))
+        self.assertTrue(_certificate_status("develop", "frontend-tls").startswith("ready"))
+
+    @patch("src.scanners.critical_endpoint.k8s.CustomObjectsApi")
+    def test_not_ready_and_unknown_secret(self, mock_api):
+        from src.scanners.critical_endpoint import _certificate_status
+        mock_api.return_value.list_namespaced_custom_object.return_value = self._certs(
+            self._cert("frontend", "frontend-tls", "False"))
+        self.assertTrue(_certificate_status("develop", "frontend-tls").startswith("NOT READY"))
+        self.assertIn("no cert-manager Certificate", _certificate_status("develop", "other-tls"))

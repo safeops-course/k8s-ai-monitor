@@ -645,7 +645,7 @@ def cmd_check_backups(args):
     min_size = config.BACKUP_STORAGE_MIN_SIZE_BYTES
 
     for ns in namespaces:
-        # Discover postgres services from db-* secrets
+        # Discover postgres services from the backup CronJobs
         pg_services = scanner._discover_postgres_services(ns)
         if pg_services:
             print(f"  [{ns}] Postgres services: {', '.join(pg_services)}")
