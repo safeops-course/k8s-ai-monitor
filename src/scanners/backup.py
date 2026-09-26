@@ -1,7 +1,6 @@
-"""Backup scanner — checks CloudNativePG, CronJob-based, and Percona MongoDB backups."""
+"""Backup scanner — checks CloudNativePG and CronJob-based (pg_dump) backups."""
 import gzip
 import logging
-import struct
 from datetime import date, datetime, timedelta, timezone
 
 from kubernetes import client as k8s
@@ -13,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _TWO_HOURS = 2 * 3600
 
-_BACKUP_CRONJOB_NAMES = ("postgres-backup", "pg-backup", "mongo-backup", "mongodb-backup")
+_BACKUP_CRONJOB_NAMES = ("postgres-backup", "pg-backup")
 
 
 def _is_backup_cronjob(name: str) -> bool:
@@ -64,7 +63,6 @@ class BackupScanner:
         results: list[ScanResult] = []
         results.extend(self._check_cnpg())
         results.extend(self._check_cronjob())
-        results.extend(self._check_percona())
 
         # Storage verification — once per day at the configured hour
         results.extend(self._check_storage())
@@ -363,119 +361,6 @@ class BackupScanner:
 
         return "\n".join(lines)
 
-    # ── Percona MongoDB Backups ────────────────────────────────────
-
-    def _check_percona(self) -> list[ScanResult]:
-        custom = k8s.CustomObjectsApi()
-        results: list[ScanResult] = []
-
-        try:
-            backups = custom.list_cluster_custom_object(
-                "psmdb.percona.com", "v1", "perconaservermongodbbackups",
-            )
-        except k8s.ApiException as e:
-            if e.status == 404:
-                logger.debug("Percona PSMDB CRDs not available, skipping")
-            else:
-                logger.warning("Failed to list Percona backups: %s", e.reason)
-            return []
-        except Exception:
-            logger.debug("Percona PSMDB not available, skipping")
-            return []
-
-        now = datetime.now(timezone.utc)
-        max_age = config.BACKUP_MAX_AGE_HOURS
-
-        # Group by namespace/cluster
-        clusters: dict[str, list[dict]] = {}
-        for b in backups.get("items", []):
-            ns = b["metadata"]["namespace"]
-            if ns in config.EXCLUDE_NAMESPACES:
-                continue
-            cluster = b.get("spec", {}).get("clusterName", b.get("spec", {}).get("psmdbCluster", "unknown"))
-            key = f"{ns}/{cluster}"
-            clusters.setdefault(key, []).append(b)
-
-        for key, items in clusters.items():
-            ns, cluster_name = key.split("/", 1)
-            items.sort(
-                key=lambda b: b["metadata"].get("creationTimestamp", ""), reverse=True,
-            )
-            last_3 = items[:3]
-            latest = items[0]
-
-            status = latest.get("status", {})
-            state = status.get("state", "unknown")
-            created = _parse_time(latest["metadata"].get("creationTimestamp"))
-            completed = _parse_time(status.get("completedAt") or status.get("lastTransitionTime"))
-            age = _age_hours(completed or created, now)
-
-            issue = None
-            severity = "critical"
-            auto_resolve = False
-
-            if state == "error":
-                issue = f"Latest Percona backup failed for cluster {cluster_name}"
-            elif state == "ready":
-                if age is not None and age > max_age:
-                    issue = f"Latest Percona backup is {age:.1f}h old (>{max_age}h) for cluster {cluster_name}"
-                else:
-                    auto_resolve = True
-            elif state == "running":
-                running_secs = (now - created).total_seconds() if created else 0
-                if running_secs > _TWO_HOURS:
-                    issue = f"Percona backup running for {running_secs / 3600:.1f}h for cluster {cluster_name}"
-                    severity = "warning"
-            else:
-                if age is not None and age > max_age:
-                    issue = f"Latest Percona backup state '{state}', {age:.1f}h old for cluster {cluster_name}"
-
-            if auto_resolve:
-                results.append(ScanResult(
-                    state_key=f"Backup:psmdb:{ns}/{cluster_name}",
-                    title=f"Backup OK: Percona cluster {cluster_name}",
-                    severity="info",
-                    resource=f"PerconaBackup/{latest['metadata']['name']}",
-                    namespace=ns,
-                    issue_type="backup",
-                    auto_resolve=True,
-                ))
-                continue
-
-            if not issue:
-                continue
-
-            context = self._percona_context(cluster_name, ns, last_3)
-            results.append(ScanResult(
-                state_key=f"Backup:psmdb:{ns}/{cluster_name}",
-                title=f"Backup: {issue}",
-                severity=severity,
-                resource=f"PerconaBackup/{latest['metadata']['name']}",
-                namespace=ns,
-                issue_type="backup",
-                context_override=context,
-            ))
-
-        return results
-
-    @staticmethod
-    def _percona_context(cluster_name: str, ns: str, last_backups: list[dict]) -> str:
-        lines = [
-            "## Percona MongoDB Backup Alert",
-            f"Cluster: {ns}/{cluster_name}",
-            "",
-        ]
-        for b in last_backups:
-            spec = b.get("spec", {})
-            status = b.get("status", {})
-            lines.append(
-                f"Backup {b['metadata']['name']}: state={status.get('state', '?')} "
-                f"storage={spec.get('storageName', '?')} "
-                f"created={b['metadata'].get('creationTimestamp', '?')} "
-                f"completed={status.get('completedAt', '?')}"
-            )
-        return "\n".join(lines)
-
     # ── Storage Verification ───────────────────────────────────────
 
     def _check_storage(self) -> list[ScanResult]:
@@ -515,7 +400,6 @@ class BackupScanner:
 
         Discovery:
         - Postgres: backup CronJobs postgres-backup-<service> / pg-backup-<service> → service
-        - MongoDB: pods with MONGO_URI env → service = owner deployment name
 
         S3 structure: {bucket}/{dump_type}/{namespace}/{service}/{YYYY}/{MM}/{DD}/{file}
         """
@@ -541,16 +425,6 @@ class BackupScanner:
                 label = f"postgres-dump/{ns}/{service}"
                 try:
                     result = self._verify_s3_service(client, bucket, "postgres-dump", ns, service, today, yesterday)
-                    results.extend(result)
-                except Exception:
-                    logger.warning("Storage check failed for %s", label, exc_info=True)
-
-            # MongoDB services from pods with MONGO_URI
-            mongo_services = self._discover_mongo_services(ns)
-            for service in mongo_services:
-                label = f"mongodb-dump/{ns}/{service}"
-                try:
-                    result = self._verify_s3_service(client, bucket, "mongodb-dump", ns, service, today, yesterday)
                     results.extend(result)
                 except Exception:
                     logger.warning("Storage check failed for %s", label, exc_info=True)
@@ -596,41 +470,6 @@ class BackupScanner:
                 logger.warning("Failed to list cronjobs in %s for postgres discovery: %s", ns, e.reason)
         except Exception:
             logger.warning("Failed to list cronjobs in %s for postgres discovery", ns, exc_info=True)
-        return sorted(services)
-
-    @staticmethod
-    def _discover_mongo_services(ns: str) -> list[str]:
-        """Discover mongo services from pods with MONGO_URI env var."""
-        core = k8s.CoreV1Api()
-        services = set()
-        try:
-            pods = core.list_namespaced_pod(ns)
-            for pod in pods.items:
-                if not pod.spec or not pod.spec.containers:
-                    continue
-                has_mongo = any(
-                    env.name == "MONGO_URI"
-                    for c in pod.spec.containers
-                    for env in (c.env or [])
-                )
-                if not has_mongo:
-                    continue
-                # Get owner deployment name
-                for owner in (pod.metadata.owner_references or []):
-                    if owner.kind == "ReplicaSet":
-                        # Strip ReplicaSet hash suffix to get Deployment name
-                        parts = owner.name.rsplit("-", 1)
-                        if len(parts) == 2:
-                            services.add(parts[0])
-                        else:
-                            services.add(owner.name)
-        except k8s.ApiException as e:
-            if e.status == 404:
-                logger.debug("Pods API not available in %s", ns)
-            else:
-                logger.warning("Failed to list pods in %s for mongo discovery: %s", ns, e.reason)
-        except Exception:
-            logger.warning("Failed to list pods in %s for mongo discovery", ns, exc_info=True)
         return sorted(services)
 
     def _verify_s3_service(
@@ -691,8 +530,7 @@ class BackupScanner:
         severity = "critical"
         integrity_info = ""
 
-        # Skip min_size check for mongodb — empty databases produce valid small dumps
-        if latest.size < min_size and not dump_type.startswith("mongodb"):
+        if latest.size < min_size:
             issue = f"Backup file suspiciously small ({_fmt_size(latest.size)}) for {label}"
             severity = "warning"
         elif config.BACKUP_STORAGE_DOWNLOAD_VERIFY:
@@ -820,16 +658,6 @@ class BackupScanner:
                     return True, "gzip valid, contains SQL markers"
                 return True, "gzip valid, no SQL markers found (may be binary format)"
 
-            if dump_type == "mongodb-dump":
-                # MongoDB archive is gzip of BSON records
-                # First 4 bytes of BSON document are little-endian int32 length
-                if len(decompressed) >= 4:
-                    bson_len = struct.unpack("<i", decompressed[:4])[0]
-                    if 4 < bson_len < 16 * 1024 * 1024:
-                        return True, f"gzip valid, BSON document length={bson_len}"
-                    return True, "gzip valid, unexpected BSON length"
-                return True, "gzip valid, decompressed data too short for BSON check"
-
             return True, "gzip valid"
 
         # ── Unknown format — basic non-null check ──
@@ -849,8 +677,6 @@ class BackupScanner:
         for prefix, dtype in [
             ("postgres-backup-", "postgres-dump"),
             ("pg-backup-", "postgres-dump"),
-            ("mongo-backup-", "mongodb-dump"),
-            ("mongodb-backup-", "mongodb-dump"),
         ]:
             if name.startswith(prefix):
                 return name[len(prefix):], dtype
@@ -954,14 +780,6 @@ class BackupScanner:
             if any(":warning:" in l for l in cj_data):
                 has_issues = True
 
-        # Percona
-        psmdb_data = self._daily_percona()
-        if psmdb_data:
-            lines.extend(psmdb_data)
-            has_data = True
-            if any(":warning:" in l or ":x:" in l for l in psmdb_data):
-                has_issues = True
-
         if not has_data:
             return None
 
@@ -1046,45 +864,5 @@ class BackupScanner:
                 age_str = f"{age:.1f}" if age else "?"
                 lines.append(f"| {ns} | {name} | {last or 'NEVER'} | {age_str} | {status}{flag} |")
                 found = True
-
-        return lines + [""] if found else None
-
-    def _daily_percona(self) -> list[str] | None:
-        custom = k8s.CustomObjectsApi()
-        try:
-            backups = custom.list_cluster_custom_object(
-                "psmdb.percona.com", "v1", "perconaservermongodbbackups",
-            )
-        except Exception:
-            logger.debug("Percona not available for daily report")
-            return None
-
-        now = datetime.now(timezone.utc)
-        lines = ["### Percona MongoDB Backups", "| Namespace | Cluster | Last Backup | Age (h) | Status |", "|---|---|---|---|---|"]
-        found = False
-
-        clusters: dict[str, list[dict]] = {}
-        for b in backups.get("items", []):
-            ns = b["metadata"]["namespace"]
-            if ns in config.EXCLUDE_NAMESPACES:
-                continue
-            cluster = b.get("spec", {}).get("clusterName", b.get("spec", {}).get("psmdbCluster", "unknown"))
-            key = f"{ns}/{cluster}"
-            clusters.setdefault(key, []).append(b)
-
-        for key, items in clusters.items():
-            ns, cluster_name = key.split("/", 1)
-            items.sort(key=lambda b: b["metadata"].get("creationTimestamp", ""), reverse=True)
-            latest = items[0]
-            status = latest.get("status", {})
-            state = status.get("state", "?")
-            created = _parse_time(latest["metadata"].get("creationTimestamp"))
-            completed = _parse_time(status.get("completedAt") or status.get("lastTransitionTime"))
-            ts = completed or created
-            age = _age_hours(ts, now)
-            flag = " :warning:" if (age and age > config.BACKUP_MAX_AGE_HOURS) or state == "error" else ""
-            age_str = f"{age:.1f}" if age else "?"
-            lines.append(f"| {ns} | {cluster_name} | {ts or '?'} | {age_str} | {state}{flag} |")
-            found = True
 
         return lines + [""] if found else None

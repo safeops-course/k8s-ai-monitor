@@ -4,7 +4,7 @@ Kubernetes monitoring operator that detects cluster issues and uses LLMs (Claude
 
 ## Features
 
-- **8 scanners** — Pods, PVCs, certificates, HTTP endpoints, critical endpoint chains, backups (CNPG, CronJob, Percona), and S3/GCS storage verification
+- **8 scanners** — Pods, PVCs, certificates, HTTP endpoints, critical endpoint chains, backups (CNPG, CronJob), and S3/GCS storage verification
 - **LLM-powered analysis** — Claude or GPT analyzes root causes with full pod context (logs, events, metrics, owner chain)
 - **Slack alerts** — Structured Block Kit messages with severity, namespace, and actionable recommendations
 - **Daily reports** — Scheduled cluster health summaries covering all monitored resources
@@ -39,15 +39,14 @@ Four detection sources feed a shared pipeline (`engine/pipeline.py`):
 | Certificate | cert-manager certificate expiry | 1 hour |
 | Endpoint | HTTP health checks on ingress endpoints | 5 min |
 | Critical Endpoint | Deep chain probing: Storefront → API Gateway → subgraphs | 1 min |
-| Backup | CNPG, CronJob-based, and Percona MongoDB backup status | 1 hour |
+| Backup | CNPG and CronJob-based (pg_dump) backup status | 1 hour |
 
 ### Backup Scanner
 
 Checks three backup systems with auto-discovery:
 
 - **CloudNativePG** — Queries `ScheduledBackup` and `Backup` CRs, checks phase and age
-- **CronJob** — Matches CronJobs named `*postgres-backup*`, `*pg-backup*`, `*mongo-backup*`, etc.
-- **Percona MongoDB** — Queries `PerconaServerMongoDBBackup` CRs, groups by cluster
+- **CronJob** — Matches CronJobs named `*postgres-backup*` or `*pg-backup*`
 
 **S3/GCS storage verification** runs once daily at a configurable hour. It dynamically discovers services from the bucket structure:
 
@@ -132,7 +131,7 @@ The entry point runs: `kopf run --standalone --all-namespaces src/handlers/__ini
 | `BACKUP_STORAGE_MIN_SIZE_BYTES` | `1024` | Minimum backup file size |
 | `BACKUP_S3_SECRET_NAME` | `s3-backup-credentials` | K8s secret with S3 credentials |
 | `BACKUP_S3_SECRET_NAMESPACE` | _(auto)_ | Namespace of S3 secret |
-| `BACKUP_STORAGE_S3_DUMP_PREFIXES` | `postgres-dump,mongodb-dump` | S3 prefix paths to scan |
+| `BACKUP_STORAGE_S3_DUMP_PREFIXES` | `postgres-dump` | S3 prefix paths to scan |
 
 ### Thresholds
 

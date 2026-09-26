@@ -54,18 +54,6 @@ def _make_scheduled_backup(name, ns, cluster, schedule="0 0 * * *"):
     }
 
 
-def _make_percona_backup(name, ns, cluster, state="ready", age_hours=2):
-    ts = (_utc_now() - timedelta(hours=age_hours)).isoformat()
-    return {
-        "metadata": {"name": name, "namespace": ns, "creationTimestamp": ts},
-        "spec": {"clusterName": cluster},
-        "status": {
-            "state": state,
-            "completedAt": ts if state == "ready" else None,
-        },
-    }
-
-
 def _make_object(key="backup.gz", size=10000, age_hours=2):
     return ObjectInfo(
         key=key, size=size,
@@ -84,12 +72,6 @@ class TestCronJobNameFilter(unittest.TestCase):
     def test_pg_backup(self):
         self.assertTrue(_is_backup_cronjob("pg-backup"))
 
-    def test_mongo_backup(self):
-        self.assertTrue(_is_backup_cronjob("mongo-backup"))
-        self.assertTrue(_is_backup_cronjob("mongo-backup-daily"))
-
-    def test_mongodb_backup(self):
-        self.assertTrue(_is_backup_cronjob("mongodb-backup"))
 
     def test_unrelated_cronjob(self):
         self.assertFalse(_is_backup_cronjob("cleanup-job"))
@@ -223,21 +205,6 @@ class TestCronJobCheck(unittest.TestCase):
         self.assertEqual(results[0].severity, "warning")
         self.assertIn("suspended", results[0].title)
 
-    @patch("src.scanners.backup.config")
-    @patch("src.scanners.backup.k8s.BatchV1Api")
-    def test_mongo_backup_cronjob_matched(self, mock_api_class, mock_config):
-        mock_config.get_namespaces.return_value = ["production"]
-        mock_config.BACKUP_MAX_AGE_HOURS = 26
-        mock_config.EXCLUDE_NAMESPACES = set()
-
-        api = mock_api_class.return_value
-        cj = _make_cronjob("mongo-backup", last_success=_hours_ago(5))
-        api.list_namespaced_cron_job.return_value = MagicMock(items=[cj])
-
-        results = self.scanner._check_cronjob()
-        self.assertEqual(len(results), 1)
-        self.assertTrue(results[0].auto_resolve)
-        self.assertIn("mongo-backup", results[0].title)
 
     @patch("src.scanners.backup.config")
     @patch("src.scanners.backup.k8s.BatchV1Api")
@@ -253,69 +220,6 @@ class TestCronJobCheck(unittest.TestCase):
         results = self.scanner._check_cronjob()
         self.assertEqual(len(results), 1)
         self.assertIn("never succeeded", results[0].title)
-
-
-# ── Percona Checks ──────────────────────────────────────────────────
-
-
-class TestPerconaCheck(unittest.TestCase):
-    def setUp(self):
-        self.scanner = BackupScanner()
-
-    @patch("src.scanners.backup.config")
-    @patch("src.scanners.backup.k8s.CustomObjectsApi")
-    def test_ready_backup_ok(self, mock_api_class, mock_config):
-        mock_config.BACKUP_MAX_AGE_HOURS = 26
-        mock_config.EXCLUDE_NAMESPACES = set()
-
-        api = mock_api_class.return_value
-        api.list_cluster_custom_object.return_value = {
-            "items": [_make_percona_backup("bk1", "production", "mongo-rs", "ready", 2)],
-        }
-
-        results = self.scanner._check_percona()
-        self.assertEqual(len(results), 1)
-        self.assertTrue(results[0].auto_resolve)
-
-    @patch("src.scanners.backup.config")
-    @patch("src.scanners.backup.k8s.CustomObjectsApi")
-    def test_error_backup(self, mock_api_class, mock_config):
-        mock_config.BACKUP_MAX_AGE_HOURS = 26
-        mock_config.EXCLUDE_NAMESPACES = set()
-
-        api = mock_api_class.return_value
-        api.list_cluster_custom_object.return_value = {
-            "items": [_make_percona_backup("bk1", "production", "mongo-rs", "error", 1)],
-        }
-
-        results = self.scanner._check_percona()
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].severity, "critical")
-        self.assertIn("failed", results[0].title)
-
-    @patch("src.scanners.backup.config")
-    @patch("src.scanners.backup.k8s.CustomObjectsApi")
-    def test_stale_percona(self, mock_api_class, mock_config):
-        mock_config.BACKUP_MAX_AGE_HOURS = 26
-        mock_config.EXCLUDE_NAMESPACES = set()
-
-        api = mock_api_class.return_value
-        api.list_cluster_custom_object.return_value = {
-            "items": [_make_percona_backup("bk1", "production", "mongo-rs", "ready", 30)],
-        }
-
-        results = self.scanner._check_percona()
-        self.assertEqual(len(results), 1)
-        self.assertIn("old", results[0].title)
-
-    @patch("src.scanners.backup.k8s.CustomObjectsApi")
-    def test_crd_not_installed(self, mock_api_class):
-        from kubernetes.client import ApiException
-        api = mock_api_class.return_value
-        api.list_cluster_custom_object.side_effect = ApiException(status=404)
-
-        results = self.scanner._check_percona()
-        self.assertEqual(results, [])
 
 
 # ── S3 Storage Verification ─────────────────────────────────────────
@@ -418,28 +322,6 @@ class TestS3ServiceVerification(unittest.TestCase):
         self.assertEqual(results[0].severity, "warning")
         self.assertIn("small", results[0].title)
 
-    def test_small_mongodb_file_is_ok(self):
-        """Small MongoDB dumps are normal — empty databases produce valid small files."""
-        client = MagicMock()
-
-        def mock_list_objects(bucket, prefix, max_keys=10):
-            if f"/{self.today:%Y}/{self.today:%m}/{self.today:%d}/" in prefix:
-                return [_make_object(size=500, age_hours=2)]
-            return []
-
-        client.list_objects.side_effect = mock_list_objects
-
-        with patch("src.scanners.backup.config") as cfg:
-            cfg.BACKUP_STORAGE_MIN_SIZE_BYTES = 1024
-            cfg.BACKUP_STORAGE_DOWNLOAD_VERIFY = False
-            cfg.BACKUP_SIZE_DROP_THRESHOLD = 0.5
-            results = self.scanner._verify_s3_service(
-                client, "test-backups", "mongodb-dump", "production", "import-service",
-                self.today, self.yesterday,
-            )
-
-        self.assertEqual(len(results), 1)
-        self.assertTrue(results[0].auto_resolve)
 
     def test_download_verify_gzip_ok(self):
         import gzip as _gzip
@@ -463,7 +345,7 @@ class TestS3ServiceVerification(unittest.TestCase):
             cfg.BACKUP_STORAGE_VERIFY_BYTES = 1048576
             cfg.BACKUP_SIZE_DROP_THRESHOLD = 0.5
             results = self.scanner._verify_s3_service(
-                client, "test-backups", "mongodb-dump", "production", "cms-service",
+                client, "test-backups", "postgres-dump", "production", "cms-service",
                 self.today, self.yesterday,
             )
 
@@ -488,7 +370,7 @@ class TestS3ServiceVerification(unittest.TestCase):
             cfg.BACKUP_STORAGE_VERIFY_BYTES = 1048576
             cfg.BACKUP_SIZE_DROP_THRESHOLD = 0.5
             results = self.scanner._verify_s3_service(
-                client, "test-backups", "mongodb-dump", "production", "cms-service",
+                client, "test-backups", "postgres-dump", "production", "cms-service",
                 self.today, self.yesterday,
             )
 
@@ -503,26 +385,24 @@ class TestS3BackupDiscovery(unittest.TestCase):
     def setUp(self):
         self.scanner = BackupScanner()
 
-    @patch.object(BackupScanner, "_discover_mongo_services")
     @patch.object(BackupScanner, "_discover_postgres_services")
     @patch.object(BackupScanner, "_find_backup_namespaces")
     @patch("src.scanners.backup.config")
-    def test_discovers_services_per_namespace(self, mock_config, mock_find_ns, mock_pg, mock_mongo):
+    def test_discovers_services_per_namespace(self, mock_config, mock_find_ns, mock_pg):
         mock_config.BACKUP_STORAGE_MIN_SIZE_BYTES = 1024
         mock_config.BACKUP_STORAGE_DOWNLOAD_VERIFY = False
         mock_config.BACKUP_SIZE_DROP_THRESHOLD = 0.5
 
         mock_find_ns.return_value = ["production"]
         mock_pg.return_value = ["core-service", "user-service"]
-        mock_mongo.return_value = ["cms-service"]
 
         client = MagicMock()
         client.bucket = "test-backups"
         client.list_objects.return_value = [_make_object(size=50000, age_hours=3)]
 
         results = self.scanner._verify_s3_backups(client)
-        # 2 pg services + 1 mongo service = 3 results
-        self.assertEqual(len(results), 3)
+        # one result per postgres service
+        self.assertEqual(len(results), 2)
         self.assertTrue(all(r.auto_resolve for r in results))
 
     @patch("src.scanners.backup.config")
@@ -533,14 +413,12 @@ class TestS3BackupDiscovery(unittest.TestCase):
         results = self.scanner._verify_s3_backups(client)
         self.assertEqual(results, [])
 
-    @patch.object(BackupScanner, "_discover_mongo_services")
     @patch.object(BackupScanner, "_discover_postgres_services")
     @patch.object(BackupScanner, "_find_backup_namespaces")
     @patch("src.scanners.backup.config")
-    def test_no_services_found(self, mock_config, mock_find_ns, mock_pg, mock_mongo):
+    def test_no_services_found(self, mock_config, mock_find_ns, mock_pg):
         mock_find_ns.return_value = ["production"]
         mock_pg.return_value = []
-        mock_mongo.return_value = []
 
         client = MagicMock()
         client.bucket = "test-backups"
@@ -548,11 +426,10 @@ class TestS3BackupDiscovery(unittest.TestCase):
         results = self.scanner._verify_s3_backups(client)
         self.assertEqual(results, [])
 
-    @patch.object(BackupScanner, "_discover_mongo_services")
     @patch.object(BackupScanner, "_discover_postgres_services")
     @patch.object(BackupScanner, "_find_backup_namespaces")
     @patch("src.scanners.backup.config")
-    def test_no_backup_namespaces(self, _mock_config, mock_find_ns, mock_pg, mock_mongo):
+    def test_no_backup_namespaces(self, _mock_config, mock_find_ns, mock_pg):
         mock_find_ns.return_value = []
 
         client = MagicMock()
@@ -561,20 +438,17 @@ class TestS3BackupDiscovery(unittest.TestCase):
         results = self.scanner._verify_s3_backups(client)
         self.assertEqual(results, [])
         mock_pg.assert_not_called()
-        mock_mongo.assert_not_called()
 
-    @patch.object(BackupScanner, "_discover_mongo_services")
     @patch.object(BackupScanner, "_discover_postgres_services")
     @patch.object(BackupScanner, "_find_backup_namespaces")
     @patch("src.scanners.backup.config")
-    def test_mixed_success_and_failure(self, mock_config, mock_find_ns, mock_pg, mock_mongo):
+    def test_mixed_success_and_failure(self, mock_config, mock_find_ns, mock_pg):
         mock_config.BACKUP_STORAGE_MIN_SIZE_BYTES = 1024
         mock_config.BACKUP_STORAGE_DOWNLOAD_VERIFY = False
         mock_config.BACKUP_SIZE_DROP_THRESHOLD = 0.5
 
         mock_find_ns.return_value = ["production"]
         mock_pg.return_value = ["core-service", "dead-service"]
-        mock_mongo.return_value = []
 
         client = MagicMock()
         client.bucket = "test-backups"
@@ -694,20 +568,6 @@ class TestFileIntegrityVerification(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("SQL markers", reason)
 
-    @patch("src.scanners.backup.config")
-    def test_gzip_with_bson(self, mock_config):
-        import gzip as _gzip
-        import struct
-        mock_config.BACKUP_STORAGE_VERIFY_BYTES = 1048576
-        client = MagicMock()
-        # Simulate a BSON document: 4-byte length header + dummy data
-        bson_len = 256
-        raw = struct.pack("<i", bson_len) + b"\x00" * (bson_len - 4)
-        compressed = _gzip.compress(raw)
-        client.download_bytes.return_value = compressed
-        ok, reason = self.scanner._verify_file_integrity(client, "bucket", "key", "mongodb-dump")
-        self.assertTrue(ok)
-        self.assertIn("BSON", reason)
 
     @patch("src.scanners.backup.config")
     def test_bad_gzip(self, mock_config):
@@ -863,14 +723,6 @@ class TestCrossCheckCronJobS3(unittest.TestCase):
         self.assertEqual(
             BackupScanner._parse_service_from_cronjob("pg-backup-user-service"),
             ("user-service", "postgres-dump"),
-        )
-        self.assertEqual(
-            BackupScanner._parse_service_from_cronjob("mongo-backup-cms-service"),
-            ("cms-service", "mongodb-dump"),
-        )
-        self.assertEqual(
-            BackupScanner._parse_service_from_cronjob("mongodb-backup-import-service"),
-            ("import-service", "mongodb-dump"),
         )
         self.assertIsNone(BackupScanner._parse_service_from_cronjob("cleanup-daily"))
 
