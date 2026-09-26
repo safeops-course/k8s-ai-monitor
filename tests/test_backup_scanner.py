@@ -904,3 +904,28 @@ class TestCertificateStatusWithoutSecrets(unittest.TestCase):
             self._cert("frontend", "frontend-tls", "False"))
         self.assertTrue(_certificate_status("develop", "frontend-tls").startswith("NOT READY"))
         self.assertIn("no cert-manager Certificate", _certificate_status("develop", "other-tls"))
+
+
+class TestCertificateStatusFailuresStayContained(unittest.TestCase):
+    @patch("src.scanners.critical_endpoint.k8s.CustomObjectsApi")
+    def test_api_error_is_logged_and_unknown(self, mock_api):
+        from kubernetes.client import ApiException
+        from src.scanners.critical_endpoint import _certificate_status
+        mock_api.return_value.list_namespaced_custom_object.side_effect = ApiException(status=500, reason="boom")
+        with self.assertLogs("src.scanners.critical_endpoint", level="WARNING"):
+            self.assertEqual(_certificate_status("develop", "frontend-tls"), "unknown (API error: boom)")
+
+    @patch("src.scanners.critical_endpoint.k8s.CustomObjectsApi")
+    def test_cert_manager_missing_is_not_an_error(self, mock_api):
+        from kubernetes.client import ApiException
+        from src.scanners.critical_endpoint import _certificate_status
+        mock_api.return_value.list_namespaced_custom_object.side_effect = ApiException(status=404)
+        self.assertEqual(_certificate_status("develop", "frontend-tls"), "unknown (cert-manager not installed)")
+
+    @patch("src.scanners.critical_endpoint.k8s.CustomObjectsApi")
+    def test_malformed_data_does_not_raise(self, mock_api):
+        from src.scanners.critical_endpoint import _certificate_status
+        malformed = {"spec": {"secretName": "frontend-tls"}, "status": {"conditions": "not-a-list"}}
+        mock_api.return_value.list_namespaced_custom_object.return_value = {"items": [malformed]}
+        with self.assertLogs("src.scanners.critical_endpoint", level="WARNING"):
+            self.assertEqual(_certificate_status("develop", "frontend-tls"), "unknown (unexpected Certificate data)")

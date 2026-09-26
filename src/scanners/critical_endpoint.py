@@ -1165,17 +1165,31 @@ class CriticalEndpointScanner:
 
 
 def _certificate_status(ns: str, secret_name: str) -> str:
-    """Ready state of the cert-manager Certificate that writes secret_name (no Secret access)."""
+    """Ready state of the cert-manager Certificate that writes secret_name (no Secret access).
+
+    Never raises: a failure here must not hide the rest of the IngressRoute report.
+    """
     try:
         certs = k8s.CustomObjectsApi().list_namespaced_custom_object("cert-manager.io", "v1", ns, "certificates")
     except k8s.ApiException as e:
-        return "unknown (cert-manager not installed)" if e.status == 404 else f"error ({e.reason})"
-    for cert in certs.get("items", []):
-        if cert.get("spec", {}).get("secretName") != secret_name:
-            continue
-        for cond in cert.get("status", {}).get("conditions", []):
-            if cond.get("type") == "Ready":
-                ready = "ready" if cond.get("status") == "True" else "NOT READY"
-                return f"{ready} (Certificate {cert['metadata']['name']}: {cond.get('message', '')})"
-        return f"no Ready condition (Certificate {cert['metadata']['name']})"
-    return "no cert-manager Certificate writes this Secret"
+        if e.status == 404:
+            return "unknown (cert-manager not installed)"
+        logger.warning("Failed to list cert-manager Certificates in %s: %s", ns, e.reason)
+        return f"unknown (API error: {e.reason})"
+    except Exception:
+        logger.warning("Failed to list cert-manager Certificates in %s", ns, exc_info=True)
+        return "unknown (lookup failed)"
+    try:
+        for cert in certs.get("items", []):
+            if cert.get("spec", {}).get("secretName") != secret_name:
+                continue
+            name = cert.get("metadata", {}).get("name", "?")
+            for cond in cert.get("status", {}).get("conditions", []):
+                if cond.get("type") == "Ready":
+                    ready = "ready" if cond.get("status") == "True" else "NOT READY"
+                    return f"{ready} (Certificate {name}: {cond.get('message', '')})"
+            return f"no Ready condition (Certificate {name})"
+        return "no cert-manager Certificate writes this Secret"
+    except Exception:
+        logger.warning("Unexpected Certificate data in %s for secret %s", ns, secret_name, exc_info=True)
+        return "unknown (unexpected Certificate data)"
