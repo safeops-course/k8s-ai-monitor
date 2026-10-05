@@ -11,8 +11,8 @@ reads the cluster (no Secrets, no writes), and its analysis is advice.
 - **Scanners** - pods, nodes, HPAs at their ceiling, PVCs (usage and growth), certificates, HTTP
   endpoints, critical endpoint chains (Traefik IngressRoutes), CloudNativePG backups and
   recoverability, plus a reconcile pass that closes incidents whose cause is gone.
-- **One pipeline for every source** - Kubernetes Warning events, Flux stalls and scanner results all
-  go through the same dedup, escalation, enrichment and resolve logic (`engine/pipeline.py`).
+- **One pipeline for every source** - Kubernetes Warning events, Flux stalls, Prometheus alerts from
+  Alertmanager (`POST /alertmanager`) and scanner results all go through the same dedup, escalation, enrichment and resolve logic (`engine/pipeline.py`).
 - **LLM analysis for production incidents** - Anthropic, OpenAI or Gemini (the cheapest). Non-prod
   incidents are tracked and posted without an LLM call, to keep the cost for production.
 - **Enrichment without an LLM** - flap history, resource trend, HPA state, last deploy, and (when
@@ -124,6 +124,7 @@ Port `HTTP_PORT` (default 8080):
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/healthz` | GET | No | Health check |
+| `/alertmanager` | POST | Token | Alertmanager webhook receiver: each alert becomes an incident (`resolved` closes it) |
 | `/report` | GET/POST | Token | Trigger daily report |
 | `/state` | GET | Token | View dedup state |
 | `/certs` | GET | Token | Trigger cert scan |
@@ -138,7 +139,7 @@ Port `HTTP_PORT` (default 8080):
 | `/suppressions` | POST | Token | Create suppression |
 | `/suppressions/{id}` | DELETE | Token | Delete suppression |
 
-Every endpoint except `/healthz` requires the `X-Internal-Token` header matching `INTERNAL_TOKEN`. Without `INTERNAL_TOKEN` the API is locked (401), not open; `/healthz` returns 503 when the SQLite store cannot be reached, so the kubelet restarts the pod.
+Every endpoint except `/healthz` requires the `X-Internal-Token` header - or `Authorization: Bearer <token>`, which Alertmanager's webhook can send - matching `INTERNAL_TOKEN`. Without `INTERNAL_TOKEN` the API is locked (401), not open; `/healthz` returns 503 when the SQLite store cannot be reached, so the kubelet restarts the pod.
 
 ## Deployment
 

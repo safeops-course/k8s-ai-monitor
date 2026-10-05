@@ -40,6 +40,7 @@ src/
 ├── handlers/                  # Kopf handlers
 │   ├── startup.py            #   startup, HTTP API (auth middleware), scanner loops, schedulers
 │   ├── events.py             #   Warning K8s events -> ScanResults through the pipeline
+│   ├── alertmanager.py       #   POST /alertmanager: Prometheus alerts -> ScanResults (never_promote)
 │   └── flux.py               #   Flux Kustomization/HelmRelease stalls -> the pipeline
 ├── engine/
 │   ├── pipeline.py           #   Shared detect -> dedup -> enrich -> analyze -> alert pipeline
@@ -127,6 +128,7 @@ Port `HTTP_PORT` (default 8080):
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/healthz` | GET | No | Health check |
+| `/alertmanager` | POST | Token | Alertmanager webhook receiver: each alert becomes an incident (`resolved` closes it) |
 | `/report` | GET/POST | Token | Trigger daily report |
 | `/state` | GET | Token | View dedup state |
 | `/certs` | GET | Token | Trigger cert scan |
@@ -141,7 +143,7 @@ Port `HTTP_PORT` (default 8080):
 | `/suppressions` | POST | Token | Create suppression |
 | `/suppressions/{id}` | DELETE | Token | Delete suppression |
 
-Auth: every route except `/healthz` needs the `X-Internal-Token` header matching `INTERNAL_TOKEN` (`_auth_middleware` in `src/handlers/startup.py`). Without `INTERNAL_TOKEN` the API is locked (401). `/healthz` pings the store and returns 503 when it cannot be reached.
+Auth: every route except `/healthz` needs `X-Internal-Token` or `Authorization: Bearer` matching `INTERNAL_TOKEN` (`_auth_middleware` in `src/handlers/startup.py`). Without `INTERNAL_TOKEN` the API is locked (401). `/healthz` pings the store and returns 503 when it cannot be reached.
 
 ## Environment Variables
 
@@ -271,7 +273,7 @@ All tools handle missing data sources gracefully. If ES/Uptrace/Prometheus is no
 
 - Never hardcode API keys, tokens, or credentials — all secrets come from env vars or K8s secrets
 - No access to Kubernetes Secrets: the ClusterRole grants none - listing or reading a Secret returns its contents. Take what you need from other objects (CNPG Cluster status, cert-manager Certificate status, events). Tokens (Slack bot, Uptrace, LLM) come from env vars that the Deployment fills from its own Secret - never from a Secret read at runtime. No exceptions
-- Use `sanitizer.py` patterns for any new context that might contain sensitive data
+- Use `sanitizer.py` for any new context that might contain sensitive data (`sanitize_dict` also redacts any string under a secret-named key). Logs and alert text are untrusted input to the LLM - redaction is not a defence against prompt injection, and the LLM's commands are proposals a person checks
 - SQL queries in `store/sqlite.py` must use parameterized queries only — never string interpolation
 - All datetimes must be timezone-aware (UTC) — never use naive datetimes
 
