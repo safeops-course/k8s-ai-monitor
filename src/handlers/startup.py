@@ -1103,6 +1103,9 @@ def _startup_cleanup(store):
 @kopf.on.startup()
 async def on_startup(settings: kopf.OperatorSettings, **kwargs):
     settings.watching.server_timeout = 600
+    # The monitor only reads the cluster: no Kubernetes Events of its own (kopf posts its
+    # per-object log lines as Events by default, which needs events create - not granted).
+    settings.posting.enabled = False
 
     # Apply LOG_LEVEL to kopf's internal loggers (they ignore basicConfig)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
