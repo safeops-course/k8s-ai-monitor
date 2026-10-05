@@ -42,5 +42,13 @@ class TestOpenAITokenParam(unittest.TestCase):
             self.assertEqual(llm._openai_token_param(model), "max_tokens", model)
 
 
+class TestOpenAISampling(unittest.TestCase):
+    def test_temperature_only_for_older_models(self):
+        with mock.patch.object(config, "LLM_TEMPERATURE", 0.0):
+            for model in ("gpt-6-luna", "gpt-6.1-sol", "gpt-5-mini"):
+                self.assertEqual(llm._openai_sampling(model), {}, model)
+            self.assertEqual(llm._openai_sampling("gpt-4o-mini"), {"temperature": 0.0})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -203,8 +203,9 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
                 del payload["logs"]
                 notes.append("logs: dropped (budget)")
             json_str = json.dumps(payload, ensure_ascii=False)
-        # Still over: the pass-through sections go last, after the logs.
-        for key in extras:
+        # Still over: the pass-through sections go last, after the logs - the largest
+        # first, so a long description goes before a one-line summary.
+        for key in sorted(extras, key=lambda k: -len(json.dumps(payload[k], ensure_ascii=False))):
             if len(json_str.encode("utf-8")) <= max_bytes:
                 break
             del payload[key]

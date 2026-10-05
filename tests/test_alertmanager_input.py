@@ -140,12 +140,10 @@ class TestWithoutAnLLMKey(unittest.TestCase):
     """kind without a key: a production incident is tracked and posted, not analysed."""
 
     def test_production_alert_is_posted_without_analysis(self):
-        import tempfile
-
         from src.engine import pipeline
         from src.engine.store.sqlite import SqliteStore
 
-        store = SqliteStore(tempfile.mkdtemp() + "/t.db")
+        store = SqliteStore(":memory:")
         with mock.patch("src.handlers.events._in_watched_namespace", return_value=True), \
              mock.patch("src.engine.pipeline.llm_configured", return_value=False), \
              mock.patch("src.engine.pipeline.analyze_alert") as llm, \
@@ -155,6 +153,16 @@ class TestWithoutAnLLMKey(unittest.TestCase):
             post.assert_called_once()
             self.assertEqual(store.get_incident(
                 "Alert:production/BackendErrorBudgetBurnFast:abc123").status, "active")
+
+    def test_production_warning_is_posted_without_a_key(self):
+        # With a key a production warning posts only if the analysis asks for a person;
+        # without one nothing could ask, and there is no daily report to carry it.
+        from src.engine import pipeline
+        r = alertmanager.alert_to_result(_alert(severity="warning"))
+        with mock.patch("src.engine.pipeline.llm_configured", return_value=False):
+            self.assertTrue(pipeline._should_post_slack(None, r, False)[0])
+        with mock.patch("src.engine.pipeline.llm_configured", return_value=True):
+            self.assertFalse(pipeline._should_post_slack(None, r, False)[0])
 
     def test_llm_configured_follows_the_provider_key(self):
         from src.engine import llm
@@ -176,13 +184,11 @@ class TestThroughThePipeline(unittest.TestCase):
     """The real pipeline and store: firing opens one incident, resolved closes it."""
 
     def test_firing_then_resolved(self):
-        import tempfile
-
         from src.engine import pipeline
         from src.engine.llm import AnalysisResult
         from src.engine.store.sqlite import SqliteStore
 
-        store = SqliteStore(tempfile.mkdtemp() + "/t.db")
+        store = SqliteStore(":memory:")
         analysis = AnalysisResult(raw_text="{}", parsed={"root_cause": "x"}, parse_error=False,
                                   model="test", tokens_in=1, tokens_out=1, cost_usd=0.0)
         with mock.patch("src.handlers.events._in_watched_namespace", return_value=True), \

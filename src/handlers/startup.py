@@ -834,8 +834,12 @@ async def _run_daily_with_retries() -> bool:
     (the one made when retrying again would exceed the window) surfaces a
     sustained outage.
 
-    Returns True if a real report was produced.
+    Returns True if a real report was produced. Without an LLM key there is nothing
+    to produce and nothing to retry: False at once, so no checkpoint is written.
     """
+    if not llm_configured():
+        logger.warning("Daily report skipped: no API key for LLM_PROVIDER=%s", config.LLM_PROVIDER)
+        return False
     interval_sec = config.DAILY_REPORT_RETRY_INTERVAL_MINUTES * 60
     window_sec = config.DAILY_REPORT_RETRY_MAX_HOURS * 3600
     loop = asyncio.get_running_loop()
@@ -1188,7 +1192,6 @@ async def on_startup(settings: kopf.OperatorSettings, **kwargs):
             logger.warning("Prometheus at %s is NOT reachable: %s", config.PROMETHEUS_URL, e)
     else:
         logger.warning("PROMETHEUS_URL not set — node metrics will use Metrics API only")
-    _check_llm()
 
     logger.info("HTTP auth: %s", "enabled (INTERNAL_TOKEN set)" if config.INTERNAL_TOKEN else "disabled")
     logger.info("State backend: sqlite (%s)", config.SQLITE_PATH)
@@ -1202,6 +1205,10 @@ async def on_startup(settings: kopf.OperatorSettings, **kwargs):
     # before store init is attempted — otherwise a synchronous get_store()
     # failure could pre-empt the bind and /healthz would be unreachable.
     await _start_http_server()
+
+    # The LLM probe is a network call of up to a minute: in a worker thread, not awaited,
+    # so neither startup nor /healthz waits for it. It only logs.
+    asyncio.get_running_loop().run_in_executor(None, _check_llm)
 
     store = get_store()
 

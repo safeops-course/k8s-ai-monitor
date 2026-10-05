@@ -161,6 +161,11 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
     if severity == "critical":
         return True, "critical severity", severity
 
+    # No LLM key: nothing can say human_needed, and there is no daily report to
+    # carry the warning either - post it, unanalysed, or nobody ever sees it.
+    if ar is None and not r.skip_llm and not llm_configured():
+        return True, "no LLM key → posted unanalysed", severity
+
     # Warning / info path: only post if LLM explicitly said human_needed.
     # This is currently only reachable via critical_endpoint (the one
     # analysis path that runs LLM); every other scanner has ar=None and

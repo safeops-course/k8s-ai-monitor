@@ -425,3 +425,11 @@ class TestPassThroughSections(unittest.TestCase):
         self.assertNotIn("ddd", payload)
         self.assertIn("logs: dropped (budget)", notes)
         self.assertEqual(notes[-1], "description: dropped (budget)")
+
+    def test_largest_pass_through_section_goes_first(self):
+        data = {"summary": "production: backend users are failing", "description": "d" * 3000}
+        payload, truncated, notes = build_alert_payload(data, "Alert/X", "safeops", 1024)
+        self.assertTrue(truncated)
+        self.assertIn("backend users are failing", payload)  # the summary stays
+        self.assertNotIn("ddd", payload)
+        self.assertEqual(notes, ["description: dropped (budget)"])

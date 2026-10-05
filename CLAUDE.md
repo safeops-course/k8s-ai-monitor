@@ -107,9 +107,13 @@ SQLite database at `SQLITE_PATH` with tables: `incidents`, `incident_occurrences
 
 `NON_PROD_NAMESPACES` — monitored, never sent to the LLM: incidents are tracked, fingerprinted and posted with their collected context to `SLACK_WEBHOOK_URL_NONPROD`, with 2x debounce. The LLM cost is kept for production.
 
-Without an API key for `LLM_PROVIDER` (`llm.llm_configured()`), every incident takes the non-prod
-path: tracked, fingerprinted and posted with its collected context, never analysed; the daily and
-weekly reports (LLM summaries) are skipped with a warning. The course runs it that way on kind.
+Without an API key for `LLM_PROVIDER` (`llm.llm_configured()`), nothing is analysed; routing
+stays the same - production stays production, with its debounce and severity gates - and every
+incident is still stored, fingerprinted and has its context collected. One gate changes: a
+production warning normally posts only when the analysis sets `human_needed`; with no analysis
+possible (and no daily report to carry it) it posts unanalysed (`_should_post_slack`). Daily and
+weekly reports (LLM summaries) are skipped with a warning; a skipped day is neither retried nor
+checkpointed. The course runs it that way on kind.
 
 System namespaces (`kube-system`, `kube-public`, `kube-node-lease`, `flux-system`) are always excluded when `WATCH_ALL_NAMESPACES=true`.
 

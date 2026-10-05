@@ -52,9 +52,10 @@ def run_daily_report(*, suppress_error_output: bool = False) -> bool:
     genuine, sustained outage is still surfaced.
     """
     if not llm_configured():
-        # Not an outage to retry: the report is an LLM summary, and there is no key.
+        # The report is an LLM summary and there is no key: nothing produced (False).
+        # The scheduler checks llm_configured() itself and does not retry.
         logger.warning("Daily report skipped: no API key for LLM_PROVIDER=%s", config.LLM_PROVIDER)
-        return True
+        return False
     if not _daily_report_lock.acquire(blocking=False):
         logger.warning("Daily report already in progress — skipping concurrent run")
         return False

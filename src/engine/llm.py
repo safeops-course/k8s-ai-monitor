@@ -563,6 +563,12 @@ def _openai_token_param(model: str) -> str:
     return "max_tokens" if model.startswith(("gpt-3", "gpt-4")) else "max_completion_tokens"
 
 
+def _openai_sampling(model: str) -> dict:
+    """GPT-4 and older take LLM_TEMPERATURE; GPT-5 and later accept only their default,
+    so it is left out for them."""
+    return {"temperature": config.LLM_TEMPERATURE} if model.startswith(("gpt-3", "gpt-4")) else {}
+
+
 def _estimate_cost(model: str, input_tokens: int | None, output_tokens: int | None,
                     flex: bool = False) -> float | None:
     if input_tokens is None or output_tokens is None:
@@ -657,7 +663,7 @@ def _call_llm(provider: str, client, model: str, system: str, user_content: str,
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-            temperature=config.LLM_TEMPERATURE,
+            **_openai_sampling(model),
             **{token_param: max_tokens},
         )
         tokens_in = resp.usage.prompt_tokens if resp.usage else 0

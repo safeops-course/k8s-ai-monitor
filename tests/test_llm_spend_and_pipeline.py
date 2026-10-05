@@ -508,7 +508,8 @@ class TestNoiseReduction(unittest.TestCase):
         """
         from src.engine.pipeline import _should_post_slack
         r = self._make_result(severity="warning")
-        should, reason, final_sev = _should_post_slack(None, r, is_collective=False)
+        with patch("src.engine.pipeline.llm_configured", return_value=True):  # a key, no verdict
+            should, reason, final_sev = _should_post_slack(None, r, is_collective=False)
         self.assertFalse(should)
         self.assertIn("daily report", reason)
         self.assertEqual(final_sev, "warning")
