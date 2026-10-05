@@ -1,5 +1,7 @@
 """Pod context collection — extracted from Collector."""
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 from kubernetes import client as k8s
@@ -17,26 +19,36 @@ _ERROR_PATTERNS = (
 )
 
 
-def collect_pod_context(pod_name: str, namespace: str, core: k8s.CoreV1Api, apps: k8s.AppsV1Api) -> dict:
-    """Collect pod context as structured dict for LLM."""
+def collect_pod_context(pod_name: str, namespace: str, core: k8s.CoreV1Api,
+                         apps: k8s.AppsV1Api, pod=None) -> dict:
+    """Collect pod context as structured dict for LLM.
+
+    The caller may pass a pre-fetched ``pod`` (V1Pod) to avoid an extra
+    ``read_namespaced_pod`` round-trip. When omitted, the pod is fetched
+    here as before.
+    """
     data = {}
 
     # Pod status
-    try:
-        pod = core.read_namespaced_pod(pod_name, namespace)
-        data["pod"] = _extract_pod_status(pod, core)
-    except k8s.ApiException as e:
-        if e.status == 404:
-            logger.debug("Pod %s/%s no longer exists, skipping context collection", namespace, pod_name)
-            return {"error": f"Pod {namespace}/{pod_name} no longer exists (deleted or recreated)"}
-        logger.exception("Failed to read pod %s/%s", namespace, pod_name)
-        return data
-    except Exception:
-        logger.exception("Failed to read pod %s/%s", namespace, pod_name)
-        return data
+    if pod is None:
+        try:
+            pod = core.read_namespaced_pod(pod_name, namespace)
+        except k8s.ApiException as e:
+            if e.status == 404:
+                logger.debug("Pod %s/%s no longer exists, skipping context collection", namespace, pod_name)
+                return {"error": f"Pod {namespace}/{pod_name} no longer exists (deleted or recreated)"}
+            logger.exception("Failed to read pod %s/%s", namespace, pod_name)
+            return data
+        except Exception:
+            logger.exception("Failed to read pod %s/%s", namespace, pod_name)
+            return data
+    data["pod"] = _extract_pod_status(pod, core)
 
-    # Pod logs — as list of strings
-    data["logs"] = _get_logs(core, pod_name, namespace)
+    # Pod logs — current + previous (when container has restarted), per container.
+    # Lines are prefixed with "[current/<container>]" or "[previous/<container>]"
+    # so the LLM sees the structure without breaking the existing list-of-strings
+    # contract that downstream formatters depend on.
+    data["logs"] = _get_logs(core, pod, namespace)
 
     # Events — as list of dicts
     data["events"] = _get_events(core, pod_name, namespace)
@@ -58,6 +70,35 @@ def collect_pod_context(pod_name: str, namespace: str, core: k8s.CoreV1Api, apps
     return {k: v for k, v in data.items() if v}
 
 
+# Common Linux exit codes that show up on a crashed container. The signal
+# half (>= 128) gives us "killed by signal N" — operators care most about
+# OOMKilled (137 = 128 + SIGKILL when cgroup OOM fires), SIGSEGV (139), and
+# SIGTERM (143, usually graceful shutdown). Everything else lands in the
+# generic "application error" bucket.
+_EXIT_CODE_MEANINGS: dict[int, str] = {
+    0: "clean exit",
+    1: "application error (uncaught exception or exit(1))",
+    2: "shell builtin misuse / bad CLI args",
+    126: "command invoked but not executable (permissions)",
+    127: "command not found in image (wrong path or missing binary)",
+    130: "killed by SIGINT (Ctrl-C)",
+    137: "killed by SIGKILL (almost always cgroup OOM — check memory limit)",
+    139: "killed by SIGSEGV (native crash / segfault)",
+    143: "killed by SIGTERM (graceful shutdown — pod was likely evicted/scaled)",
+}
+
+
+def _exit_code_meaning(code: int | None) -> str:
+    """Return a short human-readable explanation for a container exit code."""
+    if code is None:
+        return ""
+    if code in _EXIT_CODE_MEANINGS:
+        return _EXIT_CODE_MEANINGS[code]
+    if code > 128:
+        return f"killed by signal {code - 128}"
+    return f"exit code {code} (non-zero application error)"
+
+
 def _extract_pod_status(pod, core: k8s.CoreV1Api) -> dict:
     """Extract pod status as structured dict."""
     result = {
@@ -67,6 +108,13 @@ def _extract_pod_status(pod, core: k8s.CoreV1Api) -> dict:
     }
     if pod.spec.node_name:
         result["node"] = pod.spec.node_name
+
+    # Pod age — used by enrichment to correlate issues with recent deploys
+    created = pod.metadata.creation_timestamp
+    if created:
+        from datetime import datetime, timezone
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        result["age_seconds"] = max(0, age)
 
     # Container statuses
     status_map = {cs.name: cs for cs in (pod.status.container_statuses or [])}
@@ -85,14 +133,24 @@ def _extract_pod_status(pod, core: k8s.CoreV1Api) -> dict:
                 cinfo["state"] = "terminated"
                 cinfo["reason"] = cs.state.terminated.reason or ""
                 cinfo["exit_code"] = cs.state.terminated.exit_code
+                meaning = _exit_code_meaning(cs.state.terminated.exit_code)
+                if meaning:
+                    cinfo["exit_code_meaning"] = meaning
             else:
                 cinfo["state"] = "unknown"
             cinfo["restarts"] = cs.restart_count
 
-            # Exit code from last termination (for CrashLoop) — only if not currently terminated
+            # Exit code from last termination (for CrashLoop) — only if not
+            # currently terminated. Surface the human reason alongside the
+            # raw code so the LLM doesn't have to guess what 137 means.
             if cs.last_state and cs.last_state.terminated:
                 if not (cs.state and cs.state.terminated):
-                    cinfo["exit_code"] = cs.last_state.terminated.exit_code
+                    last_code = cs.last_state.terminated.exit_code
+                    cinfo["exit_code"] = last_code
+                    cinfo["last_terminated_reason"] = cs.last_state.terminated.reason or ""
+                    meaning = _exit_code_meaning(last_code)
+                    if meaning:
+                        cinfo["exit_code_meaning"] = meaning
 
         # Resources
         res = c.resources
@@ -130,6 +188,9 @@ def _extract_pod_status(pod, core: k8s.CoreV1Api) -> dict:
                 icinfo["state"] = "terminated"
                 icinfo["reason"] = t.reason or ""
                 icinfo["exit_code"] = t.exit_code
+                meaning = _exit_code_meaning(t.exit_code)
+                if meaning:
+                    icinfo["exit_code_meaning"] = meaning
             elif ic_status.state.running:
                 icinfo["state"] = "running"
             elif ic_status.state.waiting:
@@ -154,30 +215,70 @@ def _extract_pod_status(pod, core: k8s.CoreV1Api) -> dict:
     return result
 
 
-def _get_logs(core: k8s.CoreV1Api, pod_name: str, namespace: str) -> list[str]:
-    """Get pod logs as list of strings."""
+def _strip_timestamp(line: str) -> str:
+    """Strip RFC3339 timestamp prefix added by `timestamps=True` to save tokens."""
+    parts = line.split(" ", 1)
+    if len(parts) == 2 and len(parts[0]) > 18 and "T" in parts[0]:
+        return parts[1]
+    return line
+
+
+def _read_container_log(core: k8s.CoreV1Api, pod_name: str, namespace: str,
+                         container: str, *, previous: bool, tail_lines: int) -> list[str]:
+    """Single read_namespaced_pod_log call wrapped to swallow common errors.
+
+    Returns a list of timestamp-stripped lines, prefixed with a `[current/...]`
+    or `[previous/...]` marker so the consumer can tell them apart.
+    """
     try:
-        logs = core.read_namespaced_pod_log(
+        raw = core.read_namespaced_pod_log(
             pod_name, namespace,
-            tail_lines=config.POD_LOG_LINES,
-            timestamps=True,
+            container=container, previous=previous,
+            tail_lines=tail_lines, timestamps=True,
         )
-        if not logs or not logs.strip():
-            return []
-        lines = logs.strip().split("\n")
-        # Strip timestamps to save tokens
-        stripped = []
-        for line in lines:
-            # Timestamp format: 2024-01-15T10:30:00Z or similar
-            parts = line.split(" ", 1)
-            if len(parts) == 2 and len(parts[0]) > 18 and "T" in parts[0]:
-                stripped.append(parts[1])
-            else:
-                stripped.append(line)
-        return stripped
-    except Exception:
-        logger.debug("Failed to read logs for %s/%s", namespace, pod_name)
+    except Exception as exc:
+        # `previous=True` returns 400 when the container has never restarted
+        # (no prior instance to read) — that's expected, not a warning case.
+        msg = str(exc).lower()
+        if previous and ("previous terminated container" in msg or "not found" in msg):
+            logger.debug("No previous instance for %s/%s/%s", namespace, pod_name, container)
+        else:
+            logger.debug("Failed to read %s logs for %s/%s/%s: %s",
+                         "previous" if previous else "current",
+                         namespace, pod_name, container, exc)
         return []
+    if not raw or not raw.strip():
+        return []
+    tag = "previous" if previous else "current"
+    return [f"[{tag}/{container}] {_strip_timestamp(line)}"
+            for line in raw.strip().split("\n")]
+
+
+def _get_logs(core: k8s.CoreV1Api, pod, namespace: str) -> list[str]:
+    """Collect current + previous logs for every container in the pod.
+
+    Multi-container pods always use container=<name> in the API (the K8s
+    log endpoint rejects ambiguous calls), and previous logs are pulled
+    automatically when restart_count > 0 — this is the most common
+    "actual cause was in the previous instance" case for CrashLoopBackOff
+    diagnoses.
+    """
+    if pod is None or not pod.spec or not pod.spec.containers:
+        return []
+    pod_name = pod.metadata.name
+    tail = config.POD_LOG_LINES
+    status_map = {cs.name: cs for cs in (pod.status.container_statuses or [])}
+
+    out: list[str] = []
+    for c in pod.spec.containers:
+        out.extend(_read_container_log(core, pod_name, namespace, c.name,
+                                        previous=False, tail_lines=tail))
+        cs = status_map.get(c.name)
+        if cs and (cs.restart_count or 0) > 0:
+            out.extend(_read_container_log(core, pod_name, namespace, c.name,
+                                            previous=True,
+                                            tail_lines=min(tail, 50)))
+    return out
 
 
 def _get_events(core: k8s.CoreV1Api, pod_name: str, namespace: str) -> list[dict]:
@@ -304,12 +405,103 @@ def _extract_statefulset_status(sts) -> dict:
     return result
 
 
+# In-memory cache for node metrics to avoid hammering Prometheus during
+# mass alerts. Uses per-node single-flight: the first thread for a node
+# acquires the per-node lock, fetches, and populates the cache; concurrent
+# threads block on the same lock and read the cached value when it's released.
+_NODE_METRICS_TTL_SEC = 300  # 5 minutes — fresh window
+_NODE_METRICS_STALE_MAX_AGE_SEC = 1800  # 30 minutes — hard cap on serving stale
+_NODE_SINGLEFLIGHT_TIMEOUT_SEC = 60  # don't block forever on a stuck fetch
+_node_metrics_cache: dict[str, tuple[float, dict]] = {}  # {node: (ts, metrics)}
+_node_inflight_locks: dict[str, threading.Lock] = {}
+_node_cache_lock = threading.Lock()  # guards both maps above
+
+
+def _node_singleflight_lock(node_name: str) -> threading.Lock:
+    with _node_cache_lock:
+        lock = _node_inflight_locks.get(node_name)
+        if lock is None:
+            lock = threading.Lock()
+            _node_inflight_locks[node_name] = lock
+        return lock
+
+
+def _drop_inflight_lock(node_name: str) -> None:
+    """Best-effort cleanup of the per-node lock once the cache is populated.
+
+    Safe under races: if a waiter still holds a reference to the popped lock,
+    they'll release it normally and a fresh lock will be created on demand.
+    """
+    with _node_cache_lock:
+        _node_inflight_locks.pop(node_name, None)
+
+
+def _read_cached_node_metrics(node_name: str, *, allow_stale: bool = False) -> dict | None:
+    with _node_cache_lock:
+        entry = _node_metrics_cache.get(node_name)
+        if entry is None:
+            return None
+        ts, cached = entry
+        age = time.time() - ts
+        if age < _NODE_METRICS_TTL_SEC:
+            return cached
+        # Beyond fresh TTL: only allow if stale fetch is requested AND we
+        # haven't exceeded the hard stale cap. Beyond the stale cap, even
+        # stale serving is refused so the caller falls back to the Metrics API.
+        if allow_stale and age < _NODE_METRICS_STALE_MAX_AGE_SEC:
+            return cached
+    return None
+
+
 def _get_node_metrics(pod, core: k8s.CoreV1Api) -> dict | None:
-    """Get node metrics as dict."""
+    """Get node metrics as dict with per-node single-flight 5-min caching."""
     if not pod.spec.node_name:
         return None
 
     node_name = pod.spec.node_name
+
+    # Fast path: fresh cache hit, no lock contention beyond the dict read.
+    cached = _read_cached_node_metrics(node_name)
+    if cached is not None:
+        return cached
+
+    # Single-flight with bounded wait — never block forever on a stuck fetch.
+    lock = _node_singleflight_lock(node_name)
+    acquired = lock.acquire(timeout=_NODE_SINGLEFLIGHT_TIMEOUT_SEC)
+    if not acquired:
+        logger.warning("Node metrics single-flight timed out for %s after %ds — proceeding without coordination",
+                       node_name, _NODE_SINGLEFLIGHT_TIMEOUT_SEC)
+        # Fall through and fetch directly; better to make a redundant
+        # Prometheus call than to block the alert pipeline.
+        return _fetch_node_metrics_uncached(node_name, core)
+
+    try:
+        # Re-check after acquiring — another thread may have populated it.
+        cached = _read_cached_node_metrics(node_name)
+        if cached is not None:
+            return cached
+        result = _fetch_node_metrics_uncached(node_name, core)
+        if result:
+            with _node_cache_lock:
+                _node_metrics_cache[node_name] = (time.time(), result)
+            return result
+        # Fetch failed — return stale data (if still within stale_max cap)
+        # WITHOUT touching the cache entry. Re-aging the timestamp here would
+        # let the same payload live forever as long as Prometheus stays down.
+        # The stale_max cap in _read_cached_node_metrics is the upper bound on
+        # how long the original entry can keep being served.
+        stale = _read_cached_node_metrics(node_name, allow_stale=True)
+        return stale
+    finally:
+        lock.release()
+        # Drop the inflight lock after release so the dict doesn't grow
+        # unbounded with one Lock object per node ever seen. Safe under races
+        # because waiters held a strong reference before we popped.
+        _drop_inflight_lock(node_name)
+
+
+def _fetch_node_metrics_uncached(node_name: str, core: k8s.CoreV1Api) -> dict | None:
+    """Resolve node IP and query Prometheus / Metrics API. No caching."""
     node_ip = ""
     try:
         node = core.read_node(node_name)
@@ -320,12 +512,10 @@ def _get_node_metrics(pod, core: k8s.CoreV1Api) -> dict | None:
     except Exception:
         logger.debug("Failed to resolve internal IP for node %s", node_name)
 
-    # Try Prometheus first
     prom = _query_node_exporter_metrics_dict(node_name, node_ip)
     if prom:
         return prom
 
-    # Fallback to Metrics API
     logger.warning(
         "Prometheus node_exporter metrics unavailable for node %s (ip=%s, prometheus_url=%s), falling back to Metrics API",
         node_name, node_ip or "<empty>", config.PROMETHEUS_URL,

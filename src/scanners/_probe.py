@@ -245,10 +245,21 @@ def _generate_probe_id() -> str:
     return f"k8s-ai-monitor/{uuid4().hex[:8]}"
 
 
-def probe(url: str, timeout: float = 10, verify: bool = False) -> ProbeResult:
+def probe(url: str, timeout: float = 10, verify: bool = True) -> ProbeResult:
     """Probe a URL with rich timing breakdown.
 
     Works for both HTTP and HTTPS URLs. For in-cluster service probes use HTTP.
+
+    `verify` defaults to True so any caller probing a public `https://` URL
+    fails on bad / expired certs by default — an expired cert IS a
+    production outage and shouldn't silently look healthy. Callers that
+    need to skip TLS verification (self-signed internal setups, etc.)
+    must opt in explicitly with verify=False.
+
+    This is a no-op for the current in-cluster callers that use http://
+    targets. The two sibling probes that talk to a cluster IP / LB IP with
+    a Host override (`probe_via_cluster_ip`, `probe_external`) intentionally
+    hard-code verify=False — cert SANs don't match raw IPs.
     """
     from urllib.parse import urlparse
 

@@ -1,0 +1,42 @@
+# Local hooks: what CI runs, at the moment it is cheapest to fix.
+#   pip install pre-commit && pre-commit install
+# The commit stage stays fast (ruff, secrets, branch guard); the whole test suite
+# runs before a push, like the other course repositories (backend, frontend).
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # Pinned: a ruff release that adds a rule would otherwise fail commits on
+  # untouched code, with no change to blame.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      - id: ruff-check
+
+  - repo: local
+    hooks:
+      - id: config-doc
+        name: docs/configuration.md matches src/config.py
+        entry: python3 scripts/gen-config-doc.py --check
+        language: system
+        files: ^(src/config\.py|scripts/gen-config-doc\.py|docs/configuration\.md)$
+        pass_filenames: false
+
+      - id: pytest
+        name: pytest (whole suite - a change in src/ can break any test)
+        entry: python -m pytest tests/ -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

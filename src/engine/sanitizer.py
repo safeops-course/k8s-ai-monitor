@@ -31,6 +31,23 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b((?:AKIA|ASIA)[A-Z0-9]{16})\b"), "[REDACTED_AWS_KEY]"),
     # JWT tokens (three base64url segments separated by dots)
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"), "[REDACTED_JWT]"),
+    # LLM / SaaS provider API keys — these often leak verbatim into
+    # SDK exception messages (e.g. OpenAI "Incorrect API key provided:
+    # sk-..."). Redacting at sanitizer level keeps them out of Slack
+    # posts, stored context, and daily-report summaries regardless of
+    # which caller triggers the redaction.
+    # OpenAI / Anthropic: "sk-..." (Anthropic uses "sk-ant-...")
+    (re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED_LLM_KEY]"),
+    # Google / Gemini: "AIzaSy..." (39 chars total)
+    (re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b"), "[REDACTED_GOOGLE_KEY]"),
+    # Slack bot/user/app tokens: "xoxb-...", "xoxp-...", "xoxa-...", etc.
+    (re.compile(r"\bxox[abpsu]-[A-Za-z0-9-]{10,}\b"), "[REDACTED_SLACK_TOKEN]"),
+    # Slack app-level tokens "xapp-..." and rotated tokens "xoxe-...", "xoxe.xapp-..."
+    (re.compile(r"\b(?:xoxe\.)?xapp-[A-Za-z0-9-]{10,}\b"), "[REDACTED_SLACK_TOKEN]"),
+    (re.compile(r"\bxoxe-[A-Za-z0-9-]{10,}\b"), "[REDACTED_SLACK_TOKEN]"),
+    # GitHub personal access tokens: "ghp_...", "ghs_...", "github_pat_..."
+    (re.compile(r"\b(?:ghp|ghs|gho|ghu|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED_GH_TOKEN]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED_GH_PAT]"),
     # Key=value secrets (password, api_key, token, secret, etc.)
     (re.compile(
         r"(?i)((?:password|passwd|api_key|apikey|api[-_]?secret|secret[-_]?key|"

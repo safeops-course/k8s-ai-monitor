@@ -240,7 +240,7 @@ def investigate(
 
     Args:
         namespace: Kubernetes namespace to investigate.
-        pod: Optional pod name or pattern (e.g. "storefront" or "*storefront*").
+        pod: Optional pod name or pattern (e.g. "backend" or "*backend*").
         since_minutes: Look-back window in minutes (default 30).
     """
     _ensure_k8s()
@@ -461,7 +461,7 @@ def search_logs(
 
     Args:
         namespace: Kubernetes namespace.
-        pod_pattern: Pod name pattern with wildcards (e.g. "*storefront*").
+        pod_pattern: Pod name pattern with wildcards (e.g. "*backend*").
         query: Lucene query string to filter log messages.
         errors_only: If true, only return error/fatal logs.
         since_minutes: Look-back window in minutes (default 30).
@@ -496,7 +496,7 @@ def search_traces(
     """Search Uptrace spans for a service.
 
     Args:
-        service: Service name (e.g. "storefront").
+        service: Service name (e.g. "backend").
         since_minutes: Look-back window in minutes (default 30).
         errors_only: Only return error spans.
         slow: Only return slow spans (above min_duration_ms).
@@ -527,7 +527,7 @@ def get_service_stats(service: str, since_minutes: int = 30) -> dict:
     """Get Uptrace service statistics: span count, error rate, latency percentiles.
 
     Args:
-        service: Service name (e.g. "storefront").
+        service: Service name (e.g. "backend").
         since_minutes: Look-back window in minutes (default 30).
     """
     from src.collectors.uptrace import get_service_stats as _get_stats

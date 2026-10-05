@@ -112,13 +112,24 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
                 diag["previous_logs"] = _prioritize_log_lines(diag["previous_logs"], 10)
         payload["diagnostics"] = diag
 
-    # Logs: prioritize error lines, max 15, cap line lengths always
+    # Logs: prioritize error lines, max 30, cap line lengths always.
+    # 30-line cap uses the headroom we have on the 16KB budget (prod alert
+    # max ~14KB); the progressive-trim loop below is the only thing that
+    # ever lowers this further, and it only touches logs.
     if "logs" in data:
+        # Normalize to list[str]. Some scanners / context_override paths
+        # can pass a single blob string; iterating a bare string would
+        # treat each character as a "line".
+        raw_logs = data["logs"]
+        if isinstance(raw_logs, str):
+            log_lines = raw_logs.splitlines()
+        else:
+            log_lines = list(raw_logs)
         payload["logs"] = _cap_line_lengths(
-            _prioritize_log_lines(data["logs"], 15)
+            _prioritize_log_lines(log_lines, 30)
         )
-        if len(data["logs"]) > 15:
-            notes.append(f"logs: {len(data['logs'])} -> 15 (error-prioritized)")
+        if len(log_lines) > 30:
+            notes.append(f"logs: {len(log_lines)} -> 30 (error-prioritized)")
 
     # Events: max 15
     if "events" in data:
@@ -146,53 +157,39 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
 
     json_str = json.dumps(payload, ensure_ascii=False)
 
-    # Hard cap safety: progressive trim
+    # Progressive trim — logs only. Structured sections (pod, owner, events,
+    # node_metrics, diagnostics) are the load-bearing signal for root-cause
+    # analysis and must survive over-budget situations intact. The old strategy
+    # dropped node_metrics/diagnostics first; that turned OOM/crash contexts
+    # into useless stubs. Prod alert ceiling is well below the default 16KB
+    # cap, so this only kicks in on pathological log storms.
     truncated = False
     if len(json_str.encode("utf-8")) > max_bytes:
         truncated = True
 
-        # 0. Cap long log lines (vector, java stack traces, etc.)
-        if "logs" in payload:
+        trim_steps: list[tuple[str, int | None]] = [
+            ("trim_logs", 20),
+            ("trim_logs", 10),
+            ("trim_logs", 5),
+            ("cap_line_length", 300),
+            ("drop_logs", None),
+        ]
+        for step, arg in trim_steps:
+            if len(json_str.encode("utf-8")) <= max_bytes:
+                break
+            if "logs" not in payload:
+                break
             log_lines = payload["logs"].split("\n") if isinstance(payload["logs"], str) else payload["logs"]
-            payload["logs"] = "\n".join(_cap_line_lengths(log_lines))
-            notes.append("logs: lines capped to 500 chars")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 1. Drop node_metrics
-        if "node_metrics" in payload:
-            del payload["node_metrics"]
-            notes.append("node_metrics: dropped (budget)")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 2. Drop diagnostics
-        if len(json_str.encode("utf-8")) > max_bytes and "diagnostics" in payload:
-            del payload["diagnostics"]
-            notes.append("diagnostics: dropped (budget)")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 3. Trim logs to 10
-        if len(json_str.encode("utf-8")) > max_bytes and "logs" in payload:
-            log_lines = payload["logs"].split("\n") if isinstance(payload["logs"], str) else payload["logs"]
-            payload["logs"] = "\n".join(_prioritize_log_lines(log_lines, 10))
-            notes.append("logs: trimmed to 10 (budget)")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 4. Trim events to 5
-        if len(json_str.encode("utf-8")) > max_bytes and "events" in payload:
-            payload["events"] = payload["events"][:5]
-            notes.append("events: trimmed to 5 (budget)")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 5. Drop logs entirely
-        if len(json_str.encode("utf-8")) > max_bytes and "logs" in payload:
-            del payload["logs"]
-            notes.append("logs: dropped (budget)")
-            json_str = json.dumps(payload, ensure_ascii=False)
-
-        # 6. Drop owner
-        if len(json_str.encode("utf-8")) > max_bytes and "owner" in payload:
-            del payload["owner"]
-            notes.append("owner: dropped (budget)")
+            if step == "trim_logs":
+                payload["logs"] = _prioritize_log_lines(log_lines, arg or 0)
+                notes.append(f"logs: trimmed to {arg} (budget)")
+            elif step == "cap_line_length":
+                capped = [line[:arg] for line in log_lines]
+                payload["logs"] = capped
+                notes.append(f"logs: lines capped to {arg} chars (budget)")
+            elif step == "drop_logs":
+                del payload["logs"]
+                notes.append("logs: dropped (budget)")
             json_str = json.dumps(payload, ensure_ascii=False)
 
     final_bytes = len(json_str.encode("utf-8"))
@@ -203,8 +200,12 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
             resource, final_bytes, approx_tokens, max_bytes, "; ".join(notes),
         )
     if final_bytes > max_bytes:
+        # Structured sections are deliberately preserved even when over budget —
+        # dropping them would destroy exactly the signal the LLM needs.
         logger.warning(
-            "Alert context STILL over budget for %s: %dB ~%d tokens > %dB cap after all trims",
+            "Alert context STILL over budget for %s after log-only trim: "
+            "%dB ~%d tokens > %dB cap — sending as-is to preserve "
+            "pod/owner/events/node_metrics/diagnostics",
             resource, final_bytes, approx_tokens, max_bytes,
         )
         notes.append(f"OVER_BUDGET: {final_bytes}B ~{approx_tokens}tok > {max_bytes}B")
@@ -217,7 +218,7 @@ _MAX_LINE_CHARS = 500
 
 def _cap_line_lengths(lines: list[str]) -> list[str]:
     """Cap each line to _MAX_LINE_CHARS. Used during budget trimming."""
-    return [l[:_MAX_LINE_CHARS] for l in lines]
+    return [line[:_MAX_LINE_CHARS] for line in lines]
 
 
 def _prioritize_log_lines(lines: list[str], max_lines: int) -> list[str]:
@@ -225,12 +226,15 @@ def _prioritize_log_lines(lines: list[str], max_lines: int) -> list[str]:
 
     Returns at most max_lines lines, with a note if truncated.
     """
-    if len(lines) <= max_lines:
-        return lines
+    # Clean up any existing omission markers before re-evaluating
+    clean_lines = [l for l in lines if not l.startswith("[") or not l.endswith("lines omitted]")]
+
+    if len(clean_lines) <= max_lines:
+        return clean_lines
 
     error_lines = []
     other_lines = []
-    for line in lines:
+    for line in clean_lines:
         if _ERROR_RE.search(line):
             error_lines.append(line)
         else:
@@ -243,7 +247,7 @@ def _prioritize_log_lines(lines: list[str], max_lines: int) -> list[str]:
         remaining = max_lines - len(error_lines) - 1  # -1 for omission note
         result = error_lines + other_lines[-remaining:] if remaining > 0 else error_lines
 
-    omitted = len(lines) - len(result)
+    omitted = len(clean_lines) - len(result)
     if omitted > 0:
         result.append(f"[{omitted} lines omitted]")
 
@@ -265,7 +269,6 @@ def build_report_payload(data: dict, cluster: str,
     # Section limits (always applied)
     _SECTION_LIMITS = {
         "pod_restarts": 20,
-        "pod_restarts_older": 10,
         "warning_events": 15,
         "pvc_usage": 10,
         "resource_pressure": 10,

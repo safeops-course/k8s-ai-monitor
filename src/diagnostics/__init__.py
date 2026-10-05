@@ -4,7 +4,7 @@ import logging
 from kubernetes import client as k8s
 
 from src.diagnostics._base import DiagnosticPlugin
-from src.diagnostics._helpers import diag_current_usage, diag_previous_logs, diag_resource_limits
+from src.diagnostics._helpers import diag_current_usage, diag_resource_limits
 from src.diagnostics.oom import OomDiagnostic
 from src.diagnostics.crash import CrashDiagnostic
 from src.diagnostics.image_pull import ImagePullDiagnostic
@@ -30,26 +30,30 @@ ALL_PLUGINS: list[DiagnosticPlugin] = [
 _PLUGIN_MAP = {p.issue_type: p for p in ALL_PLUGINS}
 
 
-def collect_diagnostics(pod_name: str, namespace: str, issue_type: str) -> dict:
-    """Run diagnostics for a pod based on issue type. Returns structured dict."""
-    core = k8s.CoreV1Api()
+def collect_diagnostics(pod, namespace: str, issue_type: str) -> dict:
+    """Run diagnostics for an already-fetched pod object based on issue type.
 
-    try:
-        pod = core.read_namespaced_pod(pod_name, namespace)
-    except Exception:
-        logger.debug("Diagnostics: failed to read pod %s/%s", namespace, pod_name)
+    Accepts the V1Pod from the caller (the scanner / collector) so we don't
+    re-issue a `get pod` request that the upstream code has already made —
+    important under K8s API rate limits when many pods are in trouble at once.
+    Returns a structured dict.
+    """
+    if pod is None:
         return {}
+    core = k8s.CoreV1Api()
 
     data = {}
 
-    # Common diagnostics
+    # Common diagnostics.
+    # NOTE: previous_logs used to be collected here; it's now fetched by
+    # _get_logs() in collectors/pod.py for every restarted container and
+    # delivered via the `logs` field prefixed with [previous/<container>].
+    # Pulling it again here was a genuine duplicate — same K8s calls, same
+    # text in context twice, which both wasted LLM tokens and pushed useful
+    # signal out of the context window.
     current_usage = diag_current_usage(pod)
     if current_usage:
         data["current_usage"] = current_usage
-
-    previous_logs = diag_previous_logs(core, pod)
-    if previous_logs:
-        data["previous_logs"] = previous_logs
 
     resource_limits = diag_resource_limits(pod)
     if resource_limits:

@@ -87,3 +87,42 @@ def resolve_owner_key_by_name(namespace: str, pod_name: str) -> str:
     key = f"Pod:{namespace}/{pod_name}"
     _owner_cache[cache_key] = (key, now)
     return key
+
+
+def owner_fully_available(owner_key: str, namespace: str) -> bool:
+    """True when every desired replica of this workload is ready.
+
+    `owner_key` is the `"Kind:namespace/name"` form the pipeline already derives
+    from a state_key. Handles Deployment, StatefulSet and DaemonSet; anything
+    else — including the `Pod:{ns}/{name}` fallback above and synthetic keys
+    like `Collective:{ns}` — returns False.
+
+    Fails CLOSED: an unparseable key or an API error returns False, i.e. "not
+    known to be healthy". Callers that use this to decide whether to RESOLVE an
+    incident get the safe answer for free. Callers that use it to decide whether
+    to WITHHOLD an alert must invert their reading — a False here means "cannot
+    tell", and cannot-tell must never suppress.
+
+    Moved here from handlers/events.py so the engine layer can use it without
+    importing from handlers; `events._is_owner_healthy` still aliases it.
+    """
+    try:
+        kind, ns_name = owner_key.split(":", 1)
+        name = ns_name.split("/", 1)[1] if "/" in ns_name else ns_name
+    except (ValueError, IndexError):
+        return False
+    try:
+        apps = k8s.AppsV1Api()
+        if kind == "Deployment":
+            obj = apps.read_namespaced_deployment(name, namespace)
+            return (obj.status.ready_replicas or 0) >= (obj.spec.replicas or 1)
+        if kind == "StatefulSet":
+            obj = apps.read_namespaced_stateful_set(name, namespace)
+            return (obj.status.ready_replicas or 0) >= (obj.spec.replicas or 1)
+        if kind == "DaemonSet":
+            obj = apps.read_namespaced_daemon_set(name, namespace)
+            return (obj.status.number_ready or 0) >= (obj.status.desired_number_scheduled or 0)
+    except Exception:
+        logger.debug("Failed to check owner health for %s in %s", owner_key, namespace, exc_info=True)
+        return False
+    return False

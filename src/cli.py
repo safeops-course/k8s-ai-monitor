@@ -12,6 +12,7 @@ Commands:
     unsuppress      Delete a suppression rule
     reports         List daily reports
     report          Show a daily report
+    run-report      Trigger a daily (or weekly) report now
     llm-usage       Show LLM usage stats
     llm-debug       Show LLM debug payloads (requires LLM_DEBUG=true)
     state           Show dedup state summary
@@ -98,10 +99,8 @@ def cmd_health(args):
         k8s_config.load_kube_config()
 
     from src import config
-    from src.scanners.backup import _is_backup_cronjob
 
     core = k8s.CoreV1Api()
-    batch = k8s.BatchV1Api()
     now = datetime.now(timezone.utc)
     ns_filter = args.ns
 
@@ -183,35 +182,11 @@ def cmd_health(args):
         print(f"  Error loading incidents: {e}")
     print()
 
-    # --- Backup CronJobs ---
-    print("=== Backup CronJobs ===")
-    bk_headers = ["Namespace", "Name", "Suspended", "Last Success", "Age (h)"]
-    bk_rows = []
-    skipped_cj_ns = []
-    for ns in namespaces:
-        try:
-            crons = batch.list_namespaced_cron_job(ns).items
-        except Exception as e:
-            skipped_cj_ns.append((ns, str(e)))
-            continue
-        for cj in crons:
-            name = cj.metadata.name
-            if not _is_backup_cronjob(name):
-                continue
-            suspended = "yes" if cj.spec.suspend else "no"
-            last = cj.status.last_successful_time
-            if last:
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                age_h = f"{(now - last).total_seconds() / 3600:.1f}"
-                last_str = last.strftime("%Y-%m-%d %H:%M")
-            else:
-                age_h = "-"
-                last_str = "NEVER"
-            bk_rows.append([ns, name, suspended, last_str, age_h])
-    _print_table(bk_headers, bk_rows)
-    if skipped_cj_ns:
-        print(f"  (skipped {len(skipped_cj_ns)} namespace(s) due to errors: {', '.join(ns for ns, _ in skipped_cj_ns)})")
+    # --- Backups (CloudNativePG) ---
+    print("=== Backups (CloudNativePG) ===")
+    from src.scanners.backup import BackupScanner
+    cnpg_lines = BackupScanner()._daily_cnpg()
+    print("\n".join(cnpg_lines) if cnpg_lines else "  (no CloudNativePG ScheduledBackups found)")
     print()
 
     # --- Warning events (last 1h) ---
@@ -295,7 +270,12 @@ def cmd_incident(args):
         print(f"Incident #{inc.id} acknowledged")
         return
     if args.action == "resolve":
-        store.set_status(inc.id, "resolved")
+        store.set_status(inc.id, "resolved", clear_cooldown=True)
+        store.set_resolved_by(inc.id, "operator")
+        # Same as the HTTP/Slack resolve: tell the central board, or it keeps the
+        # incident open until the periodic central sync catches it.
+        from src.engine import central_push
+        central_push.push_incident_status(inc, "resolved", "operator")
         print(f"Incident #{inc.id} resolved")
         return
 
@@ -448,6 +428,35 @@ def cmd_report(args):
         print(f"\n  Raw Analysis:\n{report['analysis_raw'][:500]}")
 
 
+def cmd_run_report(args):
+    import logging
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="[%(asctime)s] %(name)s [%(levelname)-8s] %(message)s",
+    )
+
+    try:
+        from kubernetes import config as k8s_config
+        try:
+            k8s_config.load_incluster_config()
+        except k8s_config.ConfigException:
+            k8s_config.load_kube_config()
+    except Exception as e:
+        print(f"Failed to load kubeconfig: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    from src.reporter import run_daily_report, run_weekly_report
+    runner = run_weekly_report if args.weekly else run_daily_report
+    label = "weekly" if args.weekly else "daily"
+    print(f"Running {label} report...")
+    try:
+        runner()
+    except Exception as e:
+        print(f"Report failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("Done.")
+
+
 def cmd_llm_usage(args):
     store = _get_store()
     summary = store.get_llm_usage_summary(args.hours)
@@ -590,145 +599,8 @@ def cmd_state(args):
     print(f"\nTotal: {len(rows)} entries")
 
 
-def cmd_check_backups(args):
-    """Run S3/GCS backup storage verification immediately."""
-    from kubernetes import config as k8s_config
-    try:
-        k8s_config.load_incluster_config()
-    except Exception:
-        k8s_config.load_kube_config()
-
-    from src import config
-    from src.scanners.storage_verify import get_storage_client, S3Client
-
-    provider = config.BACKUP_STORAGE_PROVIDER
-    if not provider:
-        print("BACKUP_STORAGE_PROVIDER is not set. Set it to 's3' or 'gcs'.")
-        sys.exit(1)
-
-    print(f"Provider: {provider}")
-    client = get_storage_client()
-    if client is None:
-        print("Failed to create storage client. Check credentials and dependencies.")
-        sys.exit(1)
-
-    if not isinstance(client, S3Client):
-        print(f"Only S3 is supported for CLI check-backups (got {type(client).__name__})")
-        sys.exit(1)
-
-    bucket = client.bucket
-    if not bucket:
-        print("No bucket name found in S3 secret.")
-        sys.exit(1)
-
-    print(f"Bucket: {bucket}")
-
-    from src.scanners.backup import BackupScanner
-    scanner = BackupScanner()
-
-    if args.ns:
-        namespaces = [args.ns]
-    else:
-        namespaces = scanner._find_backup_namespaces()
-
-    if not namespaces:
-        print("No backup CronJobs found in any namespace.")
-        sys.exit(0)
-
-    print(f"Namespaces with backup CronJobs: {', '.join(namespaces)}")
-    print()
-
-    total_ok = 0
-    total_fail = 0
-    today = datetime.now(timezone.utc).date()
-    yesterday = today - timedelta(days=1)
-    min_size = config.BACKUP_STORAGE_MIN_SIZE_BYTES
-
-    for ns in namespaces:
-        # Discover postgres services from the backup CronJobs
-        pg_services = scanner._discover_postgres_services(ns)
-        if pg_services:
-            print(f"  [{ns}] Postgres services: {', '.join(pg_services)}")
-        for service in pg_services:
-            ok, fail = _check_service(client, bucket, "postgres-dump", ns, service, today, yesterday, min_size)
-            total_ok += ok
-            total_fail += fail
-
-    print(f"\nTotal: {total_ok} OK, {total_fail} failed")
-    if total_fail:
-        sys.exit(1)
 
 
-def _check_service(client, bucket, dump_type, ns, service, today, yesterday, min_size):
-    """Check a single service backup in S3. Returns (ok_count, fail_count)."""
-    from src.scanners.backup import BackupScanner
-    label = f"{dump_type}/{ns}/{service}"
-
-    # List objects for both dates
-    today_objects = []
-    yesterday_objects = []
-
-    today_prefix = f"{dump_type}/{ns}/{service}/{today:%Y}/{today:%m}/{today:%d}/"
-    yesterday_prefix = f"{dump_type}/{ns}/{service}/{yesterday:%Y}/{yesterday:%m}/{yesterday:%d}/"
-
-    try:
-        today_objects = client.list_objects(bucket, today_prefix, max_keys=3)
-    except Exception as e:
-        print(f"  ! {label:50s} ERROR listing today: {e}")
-    try:
-        yesterday_objects = client.list_objects(bucket, yesterday_prefix, max_keys=3)
-    except Exception as e:
-        print(f"  ! {label:50s} ERROR listing yesterday: {e}")
-
-    if today_objects:
-        objects = today_objects
-        check_date = today
-    elif yesterday_objects:
-        objects = yesterday_objects
-        check_date = yesterday
-    else:
-        print(f"  ✗ {label:50s} {'NO FILES':>10s}  checked {today} and {yesterday}")
-        return (0, 1)
-
-    latest = objects[0]
-    age_h = (datetime.now(timezone.utc) - latest.last_modified).total_seconds() / 3600
-    size_str = _fmt_size(latest.size)
-    ok = latest.size >= min_size
-    symbol = "✓" if ok else "!"
-
-    # Integrity check
-    integrity_str = ""
-    from src import config as cfg
-    if cfg.BACKUP_STORAGE_DOWNLOAD_VERIFY:
-        try:
-            valid, reason = BackupScanner._verify_file_integrity(client, bucket, latest.key, dump_type)
-            integrity_str = f"  [{reason}]"
-            if not valid:
-                ok = False
-                symbol = "!"
-        except Exception:
-            integrity_str = "  [integrity check error]"
-
-    # Size trending
-    trending_str = ""
-    if today_objects and yesterday_objects:
-        today_size = today_objects[0].size
-        yesterday_size = yesterday_objects[0].size
-        if yesterday_size > 0:
-            ratio = today_size / yesterday_size
-            if ratio < cfg.BACKUP_SIZE_DROP_THRESHOLD:
-                pct = (1 - ratio) * 100
-                trending_str = f"  ⚠ -{pct:.0f}% vs yesterday ({_fmt_size(yesterday_size)})"
-                ok = False
-                symbol = "!"
-            elif ratio > 3.0:
-                pct = (ratio - 1) * 100
-                trending_str = f"  ↑ +{pct:.0f}% vs yesterday ({_fmt_size(yesterday_size)})"
-            else:
-                trending_str = f"  (yesterday: {_fmt_size(yesterday_size)})"
-
-    print(f"  {symbol} {label:50s} {size_str:>10s}  {age_h:.0f}h ago  ({check_date}){integrity_str}{trending_str}")
-    return (1, 0) if ok else (0, 1)
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -1268,7 +1140,7 @@ def cmd_investigate(args):
                 continue
             print(f"  {ingress_name:50s} {rps:.2f} req/s")
             traffic_list.append({"ingress": ingress_name, "rps": round(rps, 2)})
-        # Error rates for storefront/api-gateway ingresses
+        # Error rates per ingress
         err_q = f'sum(rate(nginx_ingress_controller_requests{{namespace="{ns}",status=~"5.."}}[5m])) by (ingress)'
         err_data = prom_instant(err_q)
         err_map: dict[str, float] = {}
@@ -1602,7 +1474,7 @@ def main():
     p = sub.add_parser("suppress", help="Create a suppression rule")
     p.add_argument("--type", dest="type", default="", help="Issue type to suppress (e.g. certificate)")
     p.add_argument("--ns", default="", help="Namespace to suppress")
-    p.add_argument("--pattern", default="", help="Name pattern (glob, e.g. '*storefront*')")
+    p.add_argument("--pattern", default="", help="Name pattern (glob, e.g. '*backend*')")
     p.add_argument("--reason", default="", help="Reason for suppression")
     p.add_argument("--hours", type=float, default=None, help="Expiry in hours (default: never)")
     p.set_defaults(func=cmd_suppress)
@@ -1621,6 +1493,11 @@ def main():
     p = sub.add_parser("report", help="Show a daily report")
     p.add_argument("id", type=int, help="Report ID")
     p.set_defaults(func=cmd_report)
+
+    # run-report
+    p = sub.add_parser("run-report", help="Trigger a daily (or weekly) report now")
+    p.add_argument("--weekly", action="store_true", help="Run the weekly report instead of the daily one")
+    p.set_defaults(func=cmd_run_report)
 
     # llm-usage
     p = sub.add_parser("llm-usage", help="Show LLM usage statistics")
@@ -1644,15 +1521,11 @@ def main():
     p = sub.add_parser("state", help="Show dedup state summary")
     p.set_defaults(func=cmd_state)
 
-    # check-backups
-    p = sub.add_parser("check-backups", help="Run backup storage verification now")
-    p.add_argument("--ns", default="", help="Check only this namespace (default: all)")
-    p.set_defaults(func=cmd_check_backups)
 
     # logs
     p = sub.add_parser("logs", help="Search Elasticsearch logs")
     p.add_argument("--ns", default="", help="Namespace (default: production)")
-    p.add_argument("--pod", default="", help="Pod name pattern (glob, e.g. '*storefront*')")
+    p.add_argument("--pod", default="", help="Pod name pattern (glob, e.g. '*backend*')")
     p.add_argument("--query", default="", help="Query string (e.g. 'timeout OR 503')")
     p.add_argument("--errors", action="store_true", help="Show only error logs")
     p.add_argument("--since", type=int, default=30, help="Look back minutes (default: 30)")
@@ -1691,6 +1564,7 @@ def main():
     p.add_argument("--ns", default="", help="Namespace (default: production)")
     p.add_argument("--pod", default="", help="Filter to specific deployment/pod name")
     p.set_defaults(func=cmd_audit)
+
 
     args = parser.parse_args()
     if not args.command:

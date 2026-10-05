@@ -9,12 +9,14 @@ from kubernetes import client as k8s
 
 from src import config
 from src.engine.constants import IMPORTANT_EVENT_REASONS, PROBLEM_ALIASES, CONTAINER_STATUS_REASONS
-from src.engine.owner import resolve_owner_key_by_name
-from src.engine.llm import analyze_alert
-from src.engine.notifier import post_alert, format_structured_analysis, get_webhook_for_namespace
+from src.engine.critical import matches_critical_service
+from src.engine.owner import owner_fully_available, resolve_owner_key_by_name
+from src.engine.pipeline import process_scan_results
+from src.engine.sanitizer import sanitize_value
 from src.collectors import Collector
 from src.collectors.node import get_node_metrics_summary
 from src.collectors.app_metrics import get_app_metrics_summary
+from src.scanners._base import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,10 @@ _STARTUP_GRACE_SECONDS = 30
 
 # In-flight state keys to prevent duplicate concurrent alerts
 _in_flight: set[str] = set()
+
+# Cap raw event messages before they land in context_override (SQLite / Slack /
+# ClickHouse). Shared by the Elasticsearch and general Warning-event paths.
+_MESSAGE_CAP = 1024
 
 _collector: Collector | None = None
 
@@ -43,6 +49,92 @@ _TRANSIENT_INFRA_REASONS = {
     "NetworkNotReady", "FailedSync",
 }
 _TRANSIENT_GRACE_SECONDS = 90
+
+# Image pull errors: often transient (DNS blip, registry throttle, network hiccup)
+_IMAGE_PULL_REASONS = {"ErrImagePull", "ImagePullBackOff"}
+_IMAGE_PULL_GRACE_SECONDS = config.IMAGE_PULL_GRACE_SECONDS
+
+# Deferred auto-resolve: after alerting on a pod event, wait a short
+# grace and check if the owner deployment recovered — emit an
+# auto_resolve ScanResult so the pipeline flips the incident to
+# resolved + posts a Slack recovery. Much faster than waiting for the
+# pod scanner's 1800s tick; pipeline handles the Slack post + central
+# push + root-cause clearing automatically.
+_AUTO_RESOLVE_DELAY = config.EVENT_AUTO_RESOLVE_DELAY_SECONDS
+
+
+# Moved to src/engine/owner.py so the engine layer can use it without importing
+# from handlers. Kept under the old private name because this module's callers
+# and their tests patch `src.handlers.events._is_owner_healthy`.
+_is_owner_healthy = owner_fully_available
+
+
+async def _deferred_auto_resolve(alerted: list[tuple[str, str, str]]):
+    """Wait, then emit auto_resolve ScanResults for owners that recovered.
+
+    The pipeline consumes auto_resolve=True ScanResults in its existing
+    path (`pipeline.py:_process_auto_resolve_results`): flips incident
+    status to resolved, posts `post_resolved` for critical severity,
+    clears root-cause marker, and pushes the resolved event to central
+    ClickHouse. Before the shared pipeline this function called
+    `store.set_status` + `post_resolved` directly; post-migration it
+    funnels through the same pipeline branch that scanner-emitted
+    auto-resolves use.
+
+    Args:
+        alerted: list of (state_key, namespace, owner_key) for fired alerts.
+    """
+    await asyncio.sleep(_AUTO_RESOLVE_DELAY)
+    from src.handlers.startup import get_store
+    store = get_store()
+    loop = asyncio.get_running_loop()
+
+    to_resolve: list[ScanResult] = []
+    for state_key, namespace, owner_key in alerted:
+        try:
+            incident = await loop.run_in_executor(None, store.get_incident, state_key)
+            if not incident or incident.status != "active":
+                continue
+            healthy = await loop.run_in_executor(None, _is_owner_healthy, owner_key, namespace)
+            if not healthy:
+                continue
+            resource = owner_key.split(":", 1)[-1] if ":" in owner_key else owner_key
+            to_resolve.append(ScanResult(
+                state_key=state_key,
+                title=f"Resolved: {state_key}",
+                severity="info",
+                resource=resource,
+                namespace=namespace,
+                issue_type=incident.issue_type,
+                auto_resolve=True,
+            ))
+        except Exception:
+            logger.warning("Deferred auto-resolve check failed for %s", state_key, exc_info=True)
+
+    if to_resolve:
+        try:
+            await loop.run_in_executor(
+                None, lambda: process_scan_results(
+                    to_resolve, store, None,
+                    get_node_metrics_summary, get_app_metrics_summary,
+                ),
+            )
+        except Exception:
+            logger.warning("Deferred auto-resolve pipeline dispatch failed", exc_info=True)
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Done-callback for fire-and-forget tasks — surface any unretrieved
+    exception in our own logger rather than letting asyncio emit a
+    terse "Task exception was never retrieved" default warning.
+
+    Cancellation is expected during shutdown and not an error.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Background task %r failed", task.get_name(), exc_info=exc)
 
 
 def _get_collector() -> Collector:
@@ -83,6 +175,12 @@ def _get_pod_status_reason(namespace: str, pod_name: str) -> tuple[str, str]:
             if cs.state and cs.state.terminated and cs.state.terminated.reason in CONTAINER_STATUS_REASONS:
                 return cs.state.terminated.reason, node
             if cs.last_state and cs.last_state.terminated and cs.last_state.terminated.reason == "OOMKilled":
+                finished = cs.last_state.terminated.finished_at
+                if finished:
+                    from datetime import datetime, timezone
+                    age_h = (datetime.now(timezone.utc) - finished).total_seconds() / 3600
+                    if age_h > 12:
+                        continue  # Stale OOMKill — pod has recovered
                 return "OOMKilled", node
 
         return "", node
@@ -102,6 +200,37 @@ def _is_pod_still_pending(namespace: str, pod_name: str) -> bool:
     except Exception:
         logger.error("_is_pod_still_pending failed for %s/%s", namespace, pod_name, exc_info=True)
         return True
+
+
+def _get_elasticsearch_health(namespace: str, name: str) -> str:
+    """Read the ECK Elasticsearch status.health, normalized to one of:
+    "yellow"/"red" (actionable), "unknown" (green/empty/missing/404 — benign,
+    skip), or "error" (read failed — do NOT treat as recovered).
+
+    Used to re-check whether an "Unhealthy: cluster health degraded" event was a
+    transient blip (recovered to green) or a persistent degrade worth alerting.
+    """
+    try:
+        custom = k8s.CustomObjectsApi()
+        obj = custom.get_namespaced_custom_object(
+            "elasticsearch.k8s.elastic.co", "v1", namespace, "elasticsearches", name,
+        )
+        health = ((obj.get("status") or {}).get("health") or "").lower()
+        # Only yellow/red are actionable; collapse green/empty/unknown/anything
+        # unexpected to "unknown" (the caller skips on both green and unknown).
+        return health if health in ("yellow", "red") else "unknown"
+    except k8s.ApiException as e:
+        if e.status == 404:
+            # CR is gone — genuinely nothing to alert on, treat as resolved.
+            logger.debug("_get_elasticsearch_health: %s/%s not found (404) — treating as resolved", namespace, name)
+            return "unknown"
+        # A failed read must NOT be mistaken for "recovered" — return a distinct
+        # sentinel so the caller forwards the Unhealthy event instead of skipping.
+        logger.warning("_get_elasticsearch_health read failed for %s/%s: %s", namespace, name, e.reason)
+        return "error"
+    except Exception:
+        logger.error("_get_elasticsearch_health read failed for %s/%s", namespace, name, exc_info=True)
+        return "error"
 
 
 def _pod_exists(namespace: str, pod_name: str) -> bool:
@@ -125,18 +254,29 @@ _MIN_UNHEALTHY_GRACE = 30
 _MAX_UNHEALTHY_GRACE = 600
 
 
-def _get_probe_grace_seconds(namespace: str, pod_name: str) -> tuple[int, bool]:
+def _get_probe_grace_seconds(namespace: str, pod_name: str) -> tuple[int, float | None]:
     """Calculate grace period from pod probe config.
 
-    Returns (grace_seconds, pod_is_young) where grace_seconds is the max
-    startup budget across all containers/probes, and pod_is_young indicates
-    whether the pod was created within that window.
+    Returns (grace_seconds, pod_age_seconds) where grace_seconds is the max
+    startup budget across all containers/probes, and pod_age_seconds is the
+    pod's age (None when the pod cannot be read — caller treats that as "not
+    young" and alerts immediately, fail-loud).
     """
     try:
         core = k8s.CoreV1Api()
         pod = core.read_namespaced_pod(pod_name, namespace)
+    except k8s.ApiException as e:
+        if e.status == 404:
+            # Pod already gone (rollout replaced it) — routine, not a failure.
+            logger.debug("Probe grace: pod %s/%s not found", namespace, pod_name)
+        else:
+            logger.warning("Probe grace: pod read failed for %s/%s: %s",
+                           namespace, pod_name, e)
+        return _MIN_UNHEALTHY_GRACE, None
     except Exception:
-        return _MIN_UNHEALTHY_GRACE, False
+        logger.warning("Probe grace: unexpected error reading pod %s/%s",
+                       namespace, pod_name, exc_info=True)
+        return _MIN_UNHEALTHY_GRACE, None
 
     # Calculate max probe startup budget across all containers
     max_budget = _MIN_UNHEALTHY_GRACE
@@ -156,15 +296,14 @@ def _get_probe_grace_seconds(namespace: str, pod_name: str) -> tuple[int, bool]:
 
     grace = min(max_budget + 10, _MAX_UNHEALTHY_GRACE)  # +10s buffer, cap at 10 min
 
-    # Check if pod is within the grace window
     created = pod.metadata.creation_timestamp
     if created:
         if hasattr(created, 'tzinfo') and created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - created).total_seconds()
-        return grace, age <= grace
+        return grace, age
 
-    return grace, False
+    return grace, None
 
 
 def _is_pod_ready_now(namespace: str, pod_name: str) -> bool:
@@ -264,8 +403,10 @@ def _is_autoscaler_scaling_up() -> bool:
 def _in_watched_namespace(namespace: str) -> bool:
     if namespace in config.EXCLUDE_NAMESPACES:
         return False
+    if namespace in config._SYSTEM_NAMESPACES:
+        return False
     if config.is_nonprod_namespace(namespace):
-        return True
+        return config.NON_PROD_SCANNER_ENABLED
     if config.WATCH_ALL_NAMESPACES:
         return True
     return namespace in config.NAMESPACES
@@ -276,40 +417,18 @@ def _make_state_key(owner_key: str, reason: str) -> str:
     return f"{owner_key}:{alias}"
 
 
-async def _analyze_and_alert(title: str, resource: str, namespace: str,
-                              context_fn, severity: str, event_reason: str = "",
-                              node: str = "", pod_name: str = "",
-                              maintenance: bool = False):
-    loop = asyncio.get_running_loop()
+def _titled_for_routing(base: str, namespace: str, maintenance: bool) -> str:
+    """Prefix maintenance / non-prod tags onto an alert title.
+
+    The pipeline re-applies the non-prod prefix idempotently; the
+    maintenance prefix is only added by the pipeline when `skip_llm` is
+    still False, so we apply it here before setting `skip_llm=True`.
+    """
     if maintenance:
-        analysis_text = "LLM analysis skipped — maintenance mode active"
-        title = f"[Maintenance] {title}"
-        model = ""
-    elif config.is_nonprod_namespace(namespace):
-        analysis_text = title
-        title = f"{config.nonprod_title_prefix(namespace)} {title}"
-        model = ""
-    else:
-        context = await loop.run_in_executor(None, context_fn)
-        res_label = f"{namespace}/{resource}"
-        ar = await loop.run_in_executor(None, analyze_alert, context, res_label)
-        analysis_text = format_structured_analysis(ar.parsed) if ar.parsed and not ar.parse_error else ar.raw_text
-        if not analysis_text or not analysis_text.strip():
-            analysis_text = "Analysis unavailable"
-        model = ar.model
-    # Log analysis so it's available even if Slack fails
-    logger.info("Analysis for %s/%s: %s", namespace, resource, analysis_text[:300])
-    node_metrics = ""
-    if node:
-        node_metrics = await loop.run_in_executor(None, get_node_metrics_summary, node)
-    app_metrics = ""
-    if pod_name:
-        app_metrics = await loop.run_in_executor(None, get_app_metrics_summary, pod_name, namespace)
-    webhook_url = get_webhook_for_namespace(namespace)
-    await loop.run_in_executor(
-        None, lambda: post_alert(title, analysis_text, severity, resource, namespace, event_reason, node, node_metrics,
-                                 app_metrics, model, webhook_url=webhook_url),
-    )
+        return f"[Maintenance] {base}"
+    if config.is_nonprod_namespace(namespace):
+        return f"{config.nonprod_title_prefix(namespace)} {base}"
+    return base
 
 
 async def _flush_pod_event_batch(ns: str, **_kwargs):
@@ -338,13 +457,23 @@ async def _flush_pod_event_batch(ns: str, **_kwargs):
     from src.handlers.startup import get_store
     store = get_store()
 
-    # Read maintenance state NOW (not from snapshot at scheduling time)
+    # Read maintenance state NOW (not from snapshot at scheduling time).
+    # The pipeline won't add the [Maintenance] title prefix once we set
+    # skip_llm=True below, so we read the flag here and fold it into the
+    # title via `_titled_for_routing`.
     maintenance = await loop.run_in_executor(None, store.is_maintenance_active)
 
-    # Filter: skip recovered pods and already-seen state_keys
+    # Kopf-specific early filter: drop recovered pods, deleted pods, and
+    # collapse duplicate (owner_key, display_reason) events within this
+    # same batch. Pipeline-side dedup (incident cooldown, suppressions,
+    # owner cooldown) is re-applied in `process_scan_results`, so the
+    # old is_seen / is_suppressed / is_owner_in_cooldown guards are no
+    # longer re-implemented here.
     pending = []
     batch_seen: set[tuple[str, str]] = set()
     for pod_name, owner_key, state_key, node, display_reason in events:
+        if any(w in owner_key for w in config.ALERT_EXCLUDE_WORKLOADS):
+            continue
         dedup_key = (owner_key, display_reason)
         if dedup_key in batch_seen:
             continue
@@ -354,100 +483,149 @@ async def _flush_pod_event_batch(ns: str, **_kwargs):
         exists = await loop.run_in_executor(None, _pod_exists, ns, pod_name)
         if not exists:
             continue
-        if await loop.run_in_executor(None, store.is_seen, state_key):
-            continue
-        alias = PROBLEM_ALIASES.get(display_reason, display_reason.lower())
-        if await loop.run_in_executor(None, store.is_suppressed, state_key, ns, alias):
-            continue
         batch_seen.add(dedup_key)
         pending.append((pod_name, owner_key, state_key, node, display_reason))
 
     if not pending:
         return
 
+    collector = _get_collector()
+
     if len(pending) < _BATCH_THRESHOLD:
-        # Few events — process individually (existing flow)
-        for pod_name, owner_key, state_key, node, display_reason in pending:
-            collector = _get_collector()
+        # Individual mode — one ScanResult per pod event, all dispatched
+        # in a single process_scan_results call. Pipeline handles
+        # fingerprinting + dedup + enrichment + Slack + threading +
+        # central push.
+        results: list[ScanResult] = []
+        for pod_name, _owner_key, state_key, node, display_reason in pending:
             alias = PROBLEM_ALIASES.get(display_reason, display_reason.lower())
-            sev = "critical" if display_reason == "OOMKilled" else "warning"
-            _dm = config.NON_PROD_DEBOUNCE_MULTIPLIER if config.is_nonprod_namespace(ns) else 1
-            await loop.run_in_executor(
-                None, lambda sk=state_key, a=alias, s=sev, dm=_dm: store.mark_seen(sk, issue_type=a, severity=s, debounce_multiplier=dm),
-            )
-            context_fn = lambda n=pod_name, nsp=ns, a=alias: collector.collect_pod_context_with_diagnostics(n, nsp, a)
-            await _analyze_and_alert(
-                title=f"Warning: {display_reason}",
+            severity = "critical" if display_reason == "OOMKilled" else "warning"
+            try:
+                pod_context = await loop.run_in_executor(
+                    None, collector.collect_pod_context_with_diagnostics,
+                    pod_name, ns, alias,
+                )
+            except Exception:
+                logger.warning(
+                    "Pod context collection failed for %s/%s (%s); "
+                    "emitting ScanResult with minimal context",
+                    ns, pod_name, alias, exc_info=True,
+                )
+                pod_context = {"event": {"pod": pod_name, "reason": display_reason}}
+            results.append(ScanResult(
+                state_key=state_key,
+                title=_titled_for_routing(f"Warning: {display_reason}", ns, maintenance),
+                severity=severity,
                 resource=f"Pod/{pod_name}",
                 namespace=ns,
-                context_fn=context_fn,
-                severity="critical" if display_reason == "OOMKilled" else "warning",
-                event_reason=display_reason,
-                node=node,
+                issue_type=alias,
                 pod_name=pod_name,
-                maintenance=maintenance,
-            )
+                node_name=node or "",
+                context_override=pod_context,
+                event_reason=display_reason,
+                skip_llm=True,
+                metadata={"reason": display_reason, "source": "event"},
+            ))
+        await loop.run_in_executor(
+            None, lambda: process_scan_results(
+                results, store, None,
+                get_node_metrics_summary, get_app_metrics_summary,
+            ),
+        )
+        _alerted = [(sk, ns, ok) for _, ok, sk, _, _ in pending]
+        if _alerted:
+            task = asyncio.create_task(_deferred_auto_resolve(_alerted))
+            task.add_done_callback(_log_task_exception)
         return
 
-    # Batch mode: single combined alert
-    _dm = config.NON_PROD_DEBOUNCE_MULTIPLIER if config.is_nonprod_namespace(ns) else 1
-    for _, _, state_key, _, dr in pending:
-        alias = PROBLEM_ALIASES.get(dr, dr.lower())
-        sev = "critical" if dr == "OOMKilled" else "warning"
-        await loop.run_in_executor(
-            None, lambda sk=state_key, a=alias, s=sev, dm=_dm: store.mark_seen(sk, issue_type=a, severity=s, debounce_multiplier=dm),
-        )
-
-    # Build combined context
-    collector = _get_collector()
+    # Batch mode — single collective ScanResult for ≥ _BATCH_THRESHOLD
+    # events. The pipeline's `_should_post_slack` special-cases
+    # `issue_type == "collective_incident"` to always post, and its
+    # collective-incident branch at process start skips doing its OWN
+    # aggregation since we pre-batched here.
     svc_names = [owner_key.split("/")[-1] for _, owner_key, _, _, _ in pending]
     reasons = sorted({dr for _, _, _, _, dr in pending})
     nodes = {p[3] for p in pending if p[3]}
 
-    reasons_str = ", ".join(reasons)
+    # Cap both lists before folding them into the rendered context.
+    # A rolling-restart cascade can dump 40+ pod names here; without a
+    # cap the body balloons past Slack block limits and wastes SQLite /
+    # ClickHouse bandwidth with a redundant pod roster that the operator
+    # will never read line-by-line anyway.
+    _SVC_CAP = 5
+    _REASON_CAP = 10
+    svc_summary = ", ".join(svc_names[:_SVC_CAP])
+    if len(svc_names) > _SVC_CAP:
+        svc_summary += f"… +{len(svc_names) - _SVC_CAP} more"
+    reasons_str = ", ".join(reasons[:_REASON_CAP])
+    if len(reasons) > _REASON_CAP:
+        reasons_str += f"… +{len(reasons) - _REASON_CAP} more"
+
     context_lines = [f"Multiple pod issues detected: {len(pending)} events in {ns}"]
-    context_lines.append(f"Affected: {', '.join(svc_names)}")
+    context_lines.append(f"Affected ({len(svc_names)}): {svc_summary}")
     context_lines.append(f"Reasons: {reasons_str}")
     node_name = ""
-    node_metrics = ""
     for n in sorted(nodes):
         nm = await loop.run_in_executor(None, get_node_metrics_summary, n)
         if nm:
             context_lines.append(f"Node ({n}): {nm}")
             if not node_name:
                 node_name = n
-                node_metrics = nm
-    context_lines.append("Multiple warnings fired within a short window — likely related to the same underlying issue or a rolling update.")
-    context = "\n".join(context_lines)
+    context_lines.append(
+        "Multiple warnings fired within a short window — likely related to "
+        "the same underlying issue or a rolling update."
+    )
 
-    batch_title = f"Warning: {len(pending)} pod issues — {reasons_str}"
-    if maintenance:
-        analysis_text = "LLM analysis skipped — maintenance mode active"
-        batch_title = f"[Maintenance] {batch_title}"
-    elif config.is_nonprod_namespace(ns):
-        analysis_text = context
-        batch_title = f"{config.nonprod_title_prefix(ns)} {batch_title}"
-    else:
-        res_label = f"{ns}/BatchAlert({len(pending)} events)"
-        ar = await loop.run_in_executor(None, analyze_alert, {"raw": context}, res_label)
-        analysis_text = format_structured_analysis(ar.parsed) if ar.parsed and not ar.parse_error else ar.raw_text
+    has_oom = any(dr == "OOMKilled" for _, _, _, _, dr in pending)
+    has_critical_svc = any(
+        matches_critical_service(owner_key.rsplit("/", 1)[-1] if owner_key else "", pod_name)
+        for pod_name, owner_key, _sk, _node, _reason in pending
+    )
+    # Severity escalates to critical when OOM is involved OR any affected
+    # service matches the infra/important tiers; otherwise warning. The
+    # pipeline respects this directly (collective_incident always posts),
+    # so the old in-handler "is_critical" gate is collapsed into severity.
+    batch_severity = "critical" if (has_oom or has_critical_svc) else "warning"
 
-    svc_summary = ", ".join(svc_names[:5])
-    if len(svc_names) > 5:
-        svc_summary += f"… +{len(svc_names) - 5} more"
-
-    batch_severity = "critical" if any(dr == "OOMKilled" for _, _, _, _, dr in pending) else "warning"
-    webhook_url = get_webhook_for_namespace(ns)
+    collective = ScanResult(
+        state_key=f"Collective:{ns}",
+        title=_titled_for_routing(
+            f"Warning: {len(pending)} pod issues — {reasons_str}", ns, maintenance,
+        ),
+        severity=batch_severity,
+        resource=f"BatchAlert/{len(pending)}-events",
+        namespace=ns,
+        issue_type="collective_incident",
+        node_name=node_name,
+        context_override={"raw": "\n".join(context_lines)},
+        event_reason=f"{reasons_str}: {svc_summary}",
+        skip_llm=True,
+        metadata={
+            "event_count": len(pending),
+            # Capped samples + total counts. Unbounded lists here were
+            # redundant with context_override (already rendered + capped
+            # via svc_summary/reasons_str) and just added payload bloat
+            # for pipelines/consumers that read ScanResult.metadata.
+            "reasons_sample": reasons[:_REASON_CAP],
+            "reasons_total": len(reasons),
+            "services_sample": svc_names[:_SVC_CAP],
+            "services_total": len(svc_names),
+            "source": "event",
+        },
+    )
     await loop.run_in_executor(
-        None, lambda: post_alert(
-            batch_title,
-            analysis_text, batch_severity,
-            f"BatchAlert/{len(pending)}-events", ns,
-            f"{reasons_str}: {svc_summary}",
-            node_name, node_metrics, "",
-            webhook_url=webhook_url,
+        None, lambda: process_scan_results(
+            [collective], store, None,
+            get_node_metrics_summary, get_app_metrics_summary,
         ),
     )
+
+    # No deferred auto-resolve here. Batch mode persists a single
+    # `Collective:{ns}` incident instead of one incident per pod, so the
+    # per-owner state_keys in `pending` have no incident rows to flip — calling
+    # _deferred_auto_resolve with them was a silent no-op that left every
+    # collective incident active forever. The pod scanner's sweep closes
+    # `Collective:{ns}` once the namespace is clean again (src/scanners/pod.py).
 
 
 @kopf.on.event("events")
@@ -488,20 +666,27 @@ async def on_warning_event(event, logger, **kwargs):
 
     store = get_store()
 
-    # Unhealthy grace: derive wait from probe config, skip if pod recovered
+    # Unhealthy grace: probe flaps early in a pod's life are startup churn
+    # until proven otherwise. Wait out the remainder of the settle window
+    # (max of the probe-config budget and UNHEALTHY_STARTUP_SETTLE_SECONDS)
+    # and alert only if the pod is STILL not ready — recovered pods exit
+    # silently. Pods older than the window alert immediately, as before.
     if reason in ("Unhealthy", "ProbeWarning") and obj_kind == "Pod":
-        grace, is_young = await asyncio.get_running_loop().run_in_executor(
+        grace, pod_age = await asyncio.get_running_loop().run_in_executor(
             None, _get_probe_grace_seconds, namespace, obj_name,
         )
-        if is_young:
-            # Pod is within probe startup window — wait for probes to settle
-            logger.debug("Unhealthy for %s/%s — pod is young, waiting %ds (probe grace)", namespace, obj_name, grace)
-            await asyncio.sleep(grace)
+        settle = max(grace, config.UNHEALTHY_STARTUP_SETTLE_SECONDS)
+        if pod_age is not None and pod_age <= settle:
+            wait = max(settle - pod_age, 1)
+            logger.debug("Unhealthy for %s/%s — pod is %.0fs old, waiting %.0fs (startup settle)",
+                         namespace, obj_name, pod_age, wait)
+            await asyncio.sleep(wait)
             ready_now = await asyncio.get_running_loop().run_in_executor(
                 None, _is_pod_ready_now, namespace, obj_name,
             )
             if ready_now:
-                logger.info("Skipping Unhealthy for %s/%s — recovered within probe grace (%ds)", namespace, obj_name, grace)
+                logger.info("Skipping Unhealthy for %s/%s — recovered within startup settle (%.0fs)",
+                            namespace, obj_name, settle)
                 return
 
         # After grace: add to batch instead of immediate alert
@@ -524,6 +709,66 @@ async def on_warning_event(event, logger, **kwargs):
                     _flush_pod_event_batch(namespace, maintenance=_maintenance_active)
                 )
         return  # Don't fall through to individual alert flow
+
+    # Elasticsearch Unhealthy: ECK fires "cluster health degraded" on any
+    # non-green blip. On a single-node cluster the daily index rollover briefly
+    # initializes new primary shards (transient yellow) that recovers in seconds.
+    # Wait, then re-read status.health: green/unknown => benign transient (skip),
+    # yellow/red => a persistent degrade worth an alert (tagged with the colour).
+    if reason == "Unhealthy" and obj_kind == "Elasticsearch" and config.ELASTICSEARCH_HEALTH_CHECK_ENABLED:
+        state_key = f"Elasticsearch:{namespace}/{obj_name}:unhealthy"
+        if state_key in _in_flight:
+            return
+        _in_flight.add(state_key)
+        try:
+            grace = config.ELASTICSEARCH_HEALTH_GRACE_SECONDS
+            if grace > 0:
+                logger.debug("Unhealthy for Elasticsearch %s/%s — waiting %ds for health to settle",
+                             namespace, obj_name, grace)
+                await asyncio.sleep(grace)
+            health = await asyncio.get_running_loop().run_in_executor(
+                None, _get_elasticsearch_health, namespace, obj_name,
+            )
+            if health in ("green", "unknown"):
+                logger.info("Skipping Unhealthy for Elasticsearch %s/%s — health=%s after %ds (transient)",
+                            namespace, obj_name, health, grace)
+                return
+            # Persistent yellow/red — actionable degrade. "error" means the
+            # re-read itself failed: we can't confirm recovery, so fail loud and
+            # forward the Unhealthy event as a warning rather than swallow it.
+            severity = "critical" if health == "red" else "warning"
+            if health == "error":
+                event_reason = (
+                    f"Elasticsearch {obj_name} health could not be re-read after "
+                    f"{grace}s — forwarding Unhealthy event (fail-loud)"
+                )
+            else:
+                event_reason = f"Elasticsearch cluster health {health} sustained {grace}s (not a transient blip)"
+            es_message = sanitize_value((obj.get("message", "") or "")[:_MESSAGE_CAP])
+            result = ScanResult(
+                state_key=state_key,
+                title=_titled_for_routing(f"Warning: Elasticsearch health {health}", namespace, _maintenance_active),
+                severity=severity,
+                resource=f"Elasticsearch/{obj_name}",
+                namespace=namespace,
+                issue_type="unhealthy",
+                context_override={"event": {
+                    "elasticsearch": obj_name, "health": health,
+                    "message": es_message, "grace_seconds": grace,
+                }},
+                event_reason=event_reason,
+                skip_llm=True,
+                metadata={"resource": obj_name, "health": health, "reason": "Unhealthy", "source": "event"},
+            )
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: process_scan_results(
+                    [result], store, None,
+                    get_node_metrics_summary, get_app_metrics_summary,
+                ),
+            )
+        finally:
+            _in_flight.discard(state_key)
+        return
 
     if reason == "FailedScheduling" and obj_kind == "Pod":
         await asyncio.sleep(300)
@@ -562,15 +807,15 @@ async def on_warning_event(event, logger, **kwargs):
         if not nr_node:
             return
 
-        # Node-level dedup (not per-pod)
+        # Node-level dedup (not per-pod) — `_in_flight` covers the whole
+        # grace-period sleep + post-wait checks + emission. Pipeline's
+        # incident cooldown handles the "don't re-fire too soon" case
+        # AFTER we emit the ScanResult.
         node_state_key = f"Node:{nr_node}:notready"
         if node_state_key in _in_flight:
             return
         _in_flight.add(node_state_key)
         try:
-            if await loop.run_in_executor(None, store.is_seen, node_state_key):
-                return
-
             # Determine wait time
             try:
                 node_obj = await loop.run_in_executor(None, core.read_node, nr_node)
@@ -586,7 +831,7 @@ async def on_warning_event(event, logger, **kwargs):
                 logger.info("NodeNotReady on node %s, waiting %ds for potential autoscaler deletion", nr_node, int(wait))
             await asyncio.sleep(wait)
 
-            # Post-wait checks
+            # Post-wait checks: node gone / being drained / now Ready
             exists, is_ready, marked = await loop.run_in_executor(None, _is_node_being_deleted, nr_node)
             if not exists:
                 logger.info("Node %s deleted (autoscaler scale-down), skipping alert", nr_node)
@@ -598,28 +843,44 @@ async def on_warning_event(event, logger, **kwargs):
                 logger.info("Node %s is now Ready, skipping alert", nr_node)
                 return
 
-            # Still NotReady — alert
-            _nr_dm = config.NON_PROD_DEBOUNCE_MULTIPLIER if config.is_nonprod_namespace(namespace) else 1
+            # Still NotReady — emit ScanResult through the pipeline.
+            logger.info("Warning event: %s — NodeNotReady (%s/%s)", node_state_key, namespace, obj_name)
+            collector = _get_collector()
+            try:
+                node_context = await loop.run_in_executor(
+                    None, collector.collect_pod_context_with_diagnostics,
+                    obj_name, namespace, "notready",
+                )
+            except Exception:
+                logger.warning(
+                    "Pod context collection failed for %s/%s (notready); "
+                    "emitting with minimal context",
+                    namespace, obj_name, exc_info=True,
+                )
+                node_context = {"event": {"pod": obj_name, "node": nr_node, "reason": "NodeNotReady"}}
+
+            result = ScanResult(
+                state_key=node_state_key,
+                title=_titled_for_routing("Warning: NodeNotReady", namespace, _maintenance_active),
+                severity="warning",
+                resource=f"Node/{nr_node}",
+                namespace=namespace,
+                issue_type="notready",
+                pod_name=obj_name,
+                node_name=nr_node,
+                context_override=node_context,
+                event_reason=f"NodeNotReady: Node {nr_node} is not ready",
+                skip_llm=True,
+                metadata={"node": nr_node, "reason": "NodeNotReady", "source": "event"},
+            )
             await loop.run_in_executor(
-                None, lambda dm=_nr_dm: store.mark_seen(node_state_key, issue_type="notready", debounce_multiplier=dm),
+                None, lambda: process_scan_results(
+                    [result], store, None,
+                    get_node_metrics_summary, get_app_metrics_summary,
+                ),
             )
         finally:
             _in_flight.discard(node_state_key)
-
-        logger.info("Warning event: %s — NodeNotReady (%s/%s)", node_state_key, namespace, obj_name)
-        collector = _get_collector()
-        context_fn = lambda n=obj_name, ns=namespace: collector.collect_pod_context_with_diagnostics(n, ns, "notready")
-        await _analyze_and_alert(
-            title="Warning: NodeNotReady",
-            resource=f"Node/{nr_node}",
-            namespace=namespace,
-            context_fn=context_fn,
-            severity="warning",
-            event_reason=f"NodeNotReady: Node {nr_node} is not ready",
-            node=nr_node,
-            pod_name=obj_name,
-            maintenance=_maintenance_active,
-        )
         return  # early return — skip the general flow
 
     # Transient infra errors (sandbox, CNI): grace period, then check if resolved
@@ -639,6 +900,36 @@ async def on_warning_event(event, logger, **kwargs):
             logger.info("Skipping %s for %s/%s — pod recovered within grace period", reason, namespace, obj_name)
             return
         # Still failing — fall through to normal pod batch flow
+
+    # Image pull errors: grace period for transient DNS/registry issues
+    if reason in ("Failed", "BackOff") and obj_kind == "Pod":
+        message = obj.get("message", "")
+        inferred = _infer_reason_from_message(reason, message)
+        if inferred in _IMAGE_PULL_REASONS:
+            logger.debug("Image pull error for %s/%s — waiting %ds for retry",
+                         namespace, obj_name, _IMAGE_PULL_GRACE_SECONDS)
+            await asyncio.sleep(_IMAGE_PULL_GRACE_SECONDS)
+            exists = await asyncio.get_running_loop().run_in_executor(
+                None, _pod_exists, namespace, obj_name,
+            )
+            if not exists:
+                logger.info("Skipping image pull for %s/%s — pod gone (transient)", namespace, obj_name)
+                return
+            ready = await asyncio.get_running_loop().run_in_executor(
+                None, _is_pod_ready_now, namespace, obj_name,
+            )
+            if ready:
+                logger.info("Skipping image pull for %s/%s — recovered within grace period", namespace, obj_name)
+                return
+            # Check if still an image pull issue (might have progressed to CrashLoop etc.)
+            status_reason, _ = await asyncio.get_running_loop().run_in_executor(
+                None, _get_pod_status_reason, namespace, obj_name,
+            )
+            if status_reason and status_reason not in _IMAGE_PULL_REASONS:
+                logger.info("Skipping image pull for %s/%s — no longer image pull (now %s)",
+                            namespace, obj_name, status_reason)
+                return
+            # Still failing — fall through to pod batch flow
 
     # Flux source-level resources: skip entirely — they don't impact running workloads
     if obj_kind in _FLUX_SOURCE_KINDS:
@@ -701,7 +992,7 @@ async def on_warning_event(event, logger, **kwargs):
                 )
         return
 
-    # --- Non-pod events: immediate alert flow ---
+    # --- Non-pod events: immediate emission via pipeline ---
     owner_key = f"{obj_kind}:{namespace}/{obj_name}"
     message = obj.get("message", "")
     display_reason = reason
@@ -714,39 +1005,52 @@ async def on_warning_event(event, logger, **kwargs):
     _in_flight.add(state_key)
 
     try:
-        if await asyncio.get_running_loop().run_in_executor(None, store.is_seen, state_key):
-            return
-        if await asyncio.get_running_loop().run_in_executor(None, store.is_suppressed, state_key, namespace, alias):
-            return
-        _ev_dm = config.NON_PROD_DEBOUNCE_MULTIPLIER if config.is_nonprod_namespace(namespace) else 1
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda dm=_ev_dm: store.mark_seen(state_key, issue_type=alias, debounce_multiplier=dm),
+        loop = asyncio.get_running_loop()
+        logger.info("Warning event: %s \u2014 %s (%s)", state_key, reason, obj_name)
+
+        # Size-bound + sanitize raw event messages before they land in
+        # context_override. The pipeline's _collect_context already
+        # re-runs sanitize_dict idempotently, but applying sanitize_value
+        # at source means a hypothetical pipeline regression can't leak
+        # raw credentials from a kubernetes Warning event into Slack /
+        # SQLite / ClickHouse. Cap at 1KB so a pathologically long event
+        # message (e.g. verbose kubelet probe failure dumps) doesn't
+        # bloat context_store rows or the central push payload.
+        raw_msg = message or ""
+        sanitized_msg = sanitize_value(raw_msg[:_MESSAGE_CAP])
+        if len(raw_msg) > _MESSAGE_CAP:
+            sanitized_msg += f"…(truncated, {len(raw_msg)} bytes total)"
+
+        short_message = sanitized_msg.split("\n")[0][:80] if sanitized_msg else ""
+        event_label = f"{display_reason}: {short_message}" if short_message else display_reason
+
+        non_pod_context = {
+            "event": {
+                "kind": obj_kind,
+                "name": obj_name,
+                "namespace": namespace,
+                "reason": reason,
+                "message": sanitized_msg,
+            }
+        }
+
+        result = ScanResult(
+            state_key=state_key,
+            title=_titled_for_routing(f"Warning: {display_reason}", namespace, _maintenance_active),
+            severity="warning",
+            resource=f"{obj_kind}/{obj_name}",
+            namespace=namespace,
+            issue_type=alias,
+            context_override=non_pod_context,
+            event_reason=event_label,
+            skip_llm=True,
+            metadata={"reason": reason, "kind": obj_kind, "source": "event"},
+        )
+        await loop.run_in_executor(
+            None, lambda: process_scan_results(
+                [result], store, None,
+                get_node_metrics_summary, get_app_metrics_summary,
+            ),
         )
     finally:
         _in_flight.discard(state_key)
-
-    logger.info("Warning event: %s \u2014 %s (%s)", state_key, reason, obj_name)
-    collector = _get_collector()
-
-    context_fn = lambda: {
-        "event": {
-            "kind": obj_kind,
-            "name": obj_name,
-            "namespace": namespace,
-            "reason": reason,
-            "message": message,
-        }
-    }
-
-    short_message = message.split("\n")[0][:80] if message else ""
-    event_label = f"{display_reason}: {short_message}" if short_message else display_reason
-
-    await _analyze_and_alert(
-        title=f"Warning: {display_reason}",
-        resource=f"{obj_kind}/{obj_name}",
-        namespace=namespace,
-        context_fn=context_fn,
-        severity="warning",
-        event_reason=event_label,
-        maintenance=_maintenance_active,
-    )

@@ -1,0 +1,32 @@
+# Lint and tests on every pull request and push to main. build.yml only builds and
+# scans the image - before this workflow, nothing in CI ran the test suite.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        # Pinned like the pre-commit hook: a new release must not fail CI on unchanged code.
+        run: pip install -r requirements.txt pytest==9.1.1 ruff==0.15.20
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Tests
+        run: python -m pytest tests/ -q

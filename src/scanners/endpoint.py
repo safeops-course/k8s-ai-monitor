@@ -156,6 +156,90 @@ def _probe_url(url: str, headers: dict, verify: bool) -> tuple[int | None, str, 
     return None, f"{last_reason} (after {_PROBE_RETRIES} attempts)", 0.0, ""
 
 
+def _probe_backend_pods(
+    core: k8s.CoreV1Api,
+    service_name: str,
+    ns: str,
+    limit: int = 3,
+) -> list[tuple[str, str, int | None, str, float]]:
+    """Probe backend pods directly on their first container port.
+
+    Returns a list of (pod_name, pod_ip, status_code, reason, elapsed) — at
+    most ``limit`` entries. Returns an empty list on any lookup failure; the
+    caller then skips the pod section entirely.
+    """
+    results: list[tuple[str, str, int | None, str, float]] = []
+    try:
+        svc = core.read_namespaced_service(service_name, ns)
+        selector = svc.spec.selector
+        if not selector:
+            return results
+        label_sel = ",".join(f"{k}={v}" for k, v in selector.items())
+        pods = core.list_namespaced_pod(ns, label_selector=label_sel)
+    except Exception as exc:
+        logger.debug(
+            "Failed to list backend pods for chain probe %s/%s: %s",
+            ns, service_name, exc, exc_info=True,
+        )
+        return results
+
+    timeout = min(config.ENDPOINT_SCAN_TIMEOUT, 5)
+    for pod in (pods.items or [])[:limit]:
+        pod_ip = pod.status.pod_ip if pod.status else ""
+        if not pod_ip:
+            continue
+        port: int | None = None
+        for c in (pod.spec.containers or []):
+            for cp in (c.ports or []):
+                if cp.container_port:
+                    port = cp.container_port
+                    break
+            if port:
+                break
+        if not port:
+            continue
+        url = f"http://{pod_ip}:{port}/"
+        start = time.time()
+        try:
+            resp = http_requests.get(url, timeout=timeout, allow_redirects=False)
+            elapsed = time.time() - start
+            results.append((pod.metadata.name, pod_ip, resp.status_code,
+                            resp.reason or "", elapsed))
+        except http_requests.Timeout:
+            results.append((pod.metadata.name, pod_ip, None,
+                            f"timeout after {timeout}s", time.time() - start))
+        except http_requests.ConnectionError as exc:
+            results.append((pod.metadata.name, pod_ip, None,
+                            f"connect error: {exc}", time.time() - start))
+        except Exception as exc:
+            logger.debug("Backend pod probe %s/%s failed: %s",
+                         pod.metadata.name, pod_ip, exc, exc_info=True)
+            # Record the failed attempt so the Probe Chain still shows which
+            # pod was tried and why — otherwise unexpected failures disappear
+            # silently from the alert while Timeout/ConnectionError don't.
+            results.append((pod.metadata.name, pod_ip, None,
+                            f"probe error: {exc}", time.time() - start))
+    return results
+
+
+def _build_probe_chain_section(
+    url: str, status_code: int | None, reason: str, elapsed: float,
+    pod_probes: list[tuple[str, str, int | None, str, float]],
+) -> str:
+    """Render the layered probe chain (service + backend pods) as markdown."""
+    lines = ["## Probe Chain"]
+    svc_status = (f"HTTP {status_code} ({reason})" if status_code
+                  else f"ERROR ({reason})")
+    lines.append(f"  service   {url}  \u2192  {svc_status}  ({elapsed:.2f}s)")
+    for pod_name, pod_ip, code, p_reason, p_elapsed in pod_probes:
+        status = (f"HTTP {code}" if code
+                  else (p_reason[:40] or "ERROR"))
+        lines.append(
+            f"    pod/{pod_name} ({pod_ip})  \u2192  {status}  ({p_elapsed:.2f}s)"
+        )
+    return "\n".join(lines)
+
+
 def _build_endpoint_context(
     ns: str, ingress_name: str, host: str, url: str,
     status_code: int | None, reason: str, elapsed: float,
@@ -163,6 +247,14 @@ def _build_endpoint_context(
     collector: Collector | None = None,
 ) -> str:
     sections = []
+
+    core = k8s.CoreV1Api()
+    if service_name and service_ns:
+        pod_probes = _probe_backend_pods(core, service_name, service_ns)
+        if pod_probes:
+            sections.append(_build_probe_chain_section(
+                url, status_code, reason, elapsed, pod_probes,
+            ))
 
     lines = [
         "## Endpoint Health Check Failed",
@@ -178,7 +270,6 @@ def _build_endpoint_context(
     sections.append("\n".join(lines))
 
     if service_name and service_ns:
-        core = k8s.CoreV1Api()
         apps = k8s.AppsV1Api()
         try:
             ep = core.read_namespaced_endpoints(service_name, service_ns)
@@ -423,7 +514,7 @@ class EndpointScanner:
                     skipped_grpc += 1
                     continue
 
-                probe_path = annotations.get("k8s-ai-monitor/probe-path", "/")
+                custom_probe_path = annotations.get("k8s-ai-monitor/probe-path")
                 expected_range = annotations.get("k8s-ai-monitor/expected-status", "200-499")
                 expected_low, expected_high = _parse_status_range(expected_range)
 
@@ -437,8 +528,11 @@ class EndpointScanner:
                     service_name = ""
                     service_port = None
                     service_ns = ns
+                    ingress_path = "/"
                     if rule.http and rule.http.paths:
-                        backend = rule.http.paths[0].backend
+                        path_entry = rule.http.paths[0]
+                        ingress_path = path_entry.path or "/"
+                        backend = path_entry.backend
                         if backend.service:
                             service_name = backend.service.name
                             if backend.service.port:
@@ -470,6 +564,7 @@ class EndpointScanner:
                     _probed_hosts.append(f"{host}→{service_name}")
                     _probed_namespaces.add(ns)
 
+                    probe_path = custom_probe_path if custom_probe_path is not None else ingress_path
                     port_suffix = f":{service_port}" if service_port else ""
                     url = f"http://{service_name}.{ns}.svc.cluster.local{port_suffix}{probe_path}"
                     status_code, reason, elapsed, body = _probe_url(url, {}, True)

@@ -14,14 +14,15 @@ class TestParseAnalysisNewSchema(unittest.TestCase):
             "root_cause": "OOM killed due to memory limit",
             "confidence": 0.85,
             "severity": "critical",
+            "human_needed": True,
             "hypotheses": [
                 {"cause": "Memory limit too low", "confidence": 0.85, "evidence": ["exit code 137", "mem_lim 256Mi"]},
                 {"cause": "Memory leak", "confidence": 0.5, "evidence": ["heap growing"]},
             ],
             "impact": "Pod restarts every 5 minutes",
-            "suggested_actions": [
-                {"action": "kubectl set resources deploy/app --limits=memory=512Mi", "priority": 1},
-                {"action": "Check for memory leaks in app code", "priority": 2},
+            "complete_elimination_plan": [
+                {"step": "kubectl set resources deploy/app --limits=memory=512Mi", "priority": 1, "description": "Increase memory limit"},
+                {"step": "Check for memory leaks in app code", "priority": 2, "description": "Investigate potential leak"},
             ],
         })
         parsed, error = parse_analysis(raw)
@@ -29,11 +30,12 @@ class TestParseAnalysisNewSchema(unittest.TestCase):
         self.assertEqual(parsed["root_cause"], "OOM killed due to memory limit")
         self.assertEqual(parsed["confidence"], 0.85)
         self.assertEqual(parsed["severity"], "critical")
+        self.assertTrue(parsed["human_needed"])
         self.assertEqual(len(parsed["hypotheses"]), 2)
         self.assertEqual(parsed["hypotheses"][0]["cause"], "Memory limit too low")
-        self.assertEqual(len(parsed["suggested_actions"]), 2)
-        self.assertEqual(parsed["suggested_actions"][0]["priority"], 1)
-        self.assertFalse(parsed["human_needed"])  # confidence >= 0.7
+        self.assertEqual(len(parsed["complete_elimination_plan"]), 2)
+        self.assertEqual(parsed["complete_elimination_plan"][0]["priority"], 1)
+        self.assertEqual(parsed["complete_elimination_plan"][0]["step"], "kubectl set resources deploy/app --limits=memory=512Mi")
 
     def test_human_needed_low_confidence(self):
         raw = json.dumps({
@@ -146,9 +148,9 @@ class TestFormatStructuredAnalysis(unittest.TestCase):
             "hypotheses": [
                 {"cause": "Memory limit too low", "confidence": 0.85, "evidence": ["exit code 137"]},
             ],
-            "suggested_actions": [
-                {"action": "Increase memory", "priority": 1},
-                {"action": "Add monitoring", "priority": 3},
+            "complete_elimination_plan": [
+                {"step": "kubectl set resources ...", "priority": 1, "description": "Increase memory"},
+                {"step": "Check logs", "priority": 3, "description": "Add monitoring"},
             ],
         }
         text = format_structured_analysis(analysis)
@@ -156,8 +158,8 @@ class TestFormatStructuredAnalysis(unittest.TestCase):
         self.assertIn("OOM killed", text)
         self.assertIn("*Hypotheses*", text)
         self.assertIn("Memory limit too low", text)
-        self.assertIn("*Suggested Actions*", text)
-        self.assertIn("Increase memory", text)
+        self.assertIn("*\u2705 Elimination Plan*", text)
+        self.assertIn("kubectl set resources ...", text)
 
     def test_old_schema_format(self):
         analysis = {
@@ -357,6 +359,69 @@ class TestFormatDailyReport(unittest.TestCase):
         # Only status block, no issue/trend/recommendation blocks
         section_blocks = [b for b in blocks if b["type"] == "section"]
         self.assertEqual(len(section_blocks), 1)
+
+
+class TestChainOfThoughtReasoning(unittest.TestCase):
+    """Phase 1: `reasoning` is the first JSON field; parser preserves it
+    from LLM output and defaults to empty string when missing or errored."""
+
+    def test_parse_analysis_preserves_reasoning_field(self):
+        """When the LLM returns a non-empty reasoning, it survives parsing
+        verbatim and ends up in the parsed dict."""
+        raw = json.dumps({
+            "reasoning": "Pod phase is CrashLoopBackOff with 5 restarts in 3 min. "
+                         "Last log shows connection refused to postgres. "
+                         "SRE knowledge base indicates this is likely a dependency "
+                         "issue, not an application bug.",
+            "root_cause": "Postgres unreachable from backend",
+            "confidence": 0.9,
+            "severity": "critical",
+            "human_needed": True,
+            "hypotheses": [
+                {"cause": "Postgres pod down", "confidence": 0.9,
+                 "evidence": ["connection refused"]},
+            ],
+            "impact": "backend 5xx cascade",
+            "complete_elimination_plan": [
+                {"step": "kubectl -n production get pods -l app=postgres",
+                 "priority": 1, "description": "Verify postgres pod state"},
+            ],
+        })
+        parsed, error = parse_analysis(raw)
+        self.assertFalse(error)
+        self.assertIn("reasoning", parsed)
+        self.assertIn("CrashLoopBackOff with 5 restarts", parsed["reasoning"])
+        self.assertIn("connection refused to postgres", parsed["reasoning"])
+        self.assertEqual(parsed["root_cause"], "Postgres unreachable from backend")
+
+    def test_parse_analysis_defaults_reasoning_to_empty_string(self):
+        """When the LLM omits reasoning entirely, parser fills the key with
+        an empty string (defensive — the prompt marks reasoning as
+        mandatory, but the parser shouldn't crash if it's missing)."""
+        raw = json.dumps({
+            "root_cause": "OOMKilled due to memory limit",
+            "confidence": 0.85,
+            "severity": "critical",
+            "human_needed": True,
+            "hypotheses": [],
+            "impact": "",
+            "complete_elimination_plan": [],
+        })
+        parsed, error = parse_analysis(raw)
+        self.assertFalse(error)
+        self.assertIn("reasoning", parsed)
+        self.assertEqual(parsed["reasoning"], "")
+
+    def test_parse_analysis_parse_error_includes_empty_reasoning(self):
+        """When the LLM returns invalid JSON, the parse-error fallback
+        dict must still include the reasoning key so downstream consumers
+        (daily enrichment, notifier, etc.) can safely read it."""
+        raw = "this is not JSON at all"
+        parsed, error = parse_analysis(raw)
+        self.assertTrue(error)
+        self.assertIn("reasoning", parsed)
+        self.assertEqual(parsed["reasoning"], "")
+        self.assertTrue(parsed.get("_parse_error"))
 
 
 if __name__ == "__main__":
