@@ -141,6 +141,12 @@ class SqliteStore:
         self._init_schema()
         logger.info("SQLite store initialized: %s", self._db_path)
 
+    def ping(self) -> None:
+        """Raise if the database cannot be reached - /healthz uses it. A trivial SELECT
+        also opens the thread-local connection, so "unable to open database file"
+        surfaces here instead of looking healthy."""
+        self._get_conn().execute("SELECT 1").fetchone()
+
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (sqlite3 connections are not thread-safe)."""
         if not hasattr(self._local, "conn") or self._local.conn is None:

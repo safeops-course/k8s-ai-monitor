@@ -245,10 +245,15 @@ def _generate_probe_id() -> str:
     return f"k8s-ai-monitor/{uuid4().hex[:8]}"
 
 
-def probe(url: str, timeout: float = 10, verify: bool = False) -> ProbeResult:
+def probe(url: str, timeout: float = 10, verify: bool = True) -> ProbeResult:
     """Probe a URL with rich timing breakdown.
 
     Works for both HTTP and HTTPS URLs. For in-cluster service probes use HTTP.
+
+    `verify` defaults to True: an expired or wrong certificate on a public https
+    URL is an outage and must not look healthy. The probes that reach a raw IP
+    with a Host header (probe_via_cluster_ip, probe_external) keep verify=False -
+    a certificate name never matches an IP.
     """
     from urllib.parse import urlparse
 

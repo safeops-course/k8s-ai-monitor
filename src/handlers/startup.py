@@ -60,8 +60,14 @@ def get_store() -> SqliteStore:
 
 
 def _check_auth(request) -> web.Response | None:
+    """Fail closed: without INTERNAL_TOKEN the HTTP API is locked (401), not open.
+
+    Before, an empty token meant no check at all - the whole management surface,
+    including side effects such as POST /report (an LLM call), was open to anyone
+    who could reach the pod.
+    """
     if not config.INTERNAL_TOKEN:
-        return None
+        return web.Response(text="HTTP API disabled: set INTERNAL_TOKEN", status=401)
     token = request.headers.get("X-Internal-Token", "")
     if token != config.INTERNAL_TOKEN:
         return web.Response(text="Forbidden", status=403)
@@ -69,7 +75,34 @@ def _check_auth(request) -> web.Response | None:
 
 
 async def _handle_healthz(request):
+    """Liveness: unhealthy (503) when the SQLite store cannot be reached.
+
+    A store that wedges - "unable to open database file" on a stale volume, a disk
+    that filled up or went read-only - does not recover by itself; a new process
+    does. Failing /healthz lets the kubelet restart the pod.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: get_store().ping())
+    except Exception as e:
+        logger.warning("healthz: store ping failed: %s", e)
+        return web.Response(text="store unhealthy", status=503)
     return web.Response(text="ok")
+
+
+@web.middleware
+async def _auth_middleware(request, handler):
+    """INTERNAL_TOKEN on every route except /healthz - one place, so no route is missed.
+
+    Before, each handler called _check_auth itself, and eleven of them did not
+    (reports, certs, state, incidents, LLM usage).
+    """
+    if request.path == "/healthz":
+        return await handler(request)
+    err = _check_auth(request)
+    if err:
+        return err
+    return await handler(request)
 
 
 async def _handle_report(request):
@@ -100,9 +133,6 @@ async def _handle_state(request):
 
 
 async def _handle_state_clear(request):
-    err = _check_auth(request)
-    if err:
-        return err
     return web.Response(text="State clear not supported (use CLI to manage incidents)", status=501)
 
 
@@ -209,9 +239,6 @@ async def _handle_llm_usage(request):
 
 
 async def _handle_llm_debug_list(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     hours = _parse_int_param(request, "hours", 24)
     if hours is None:
@@ -222,9 +249,6 @@ async def _handle_llm_debug_list(request):
 
 
 async def _handle_llm_debug_detail(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     debug_id = _parse_id(request)
     if debug_id is None:
@@ -259,9 +283,6 @@ async def _handle_report_detail(request):
 
 
 async def _handle_incident_ack(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     incident_id = _parse_id(request)
     if incident_id is None:
@@ -273,9 +294,6 @@ async def _handle_incident_ack(request):
 
 
 async def _handle_incident_resolve(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     incident_id = _parse_id(request)
     if incident_id is None:
@@ -302,9 +320,6 @@ async def _handle_maintenance_get(request):
 
 
 async def _handle_maintenance_create(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     try:
         body = await request.json()
@@ -340,9 +355,6 @@ async def _handle_maintenance_create(request):
 
 
 async def _handle_maintenance_delete(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     loop = asyncio.get_running_loop()
     deleted = await loop.run_in_executor(None, store.end_maintenance)
@@ -363,9 +375,6 @@ async def _handle_suppressions_list(request):
 
 
 async def _handle_suppression_create(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     try:
         body = await request.json()
@@ -396,9 +405,6 @@ async def _handle_suppression_create(request):
 
 
 async def _handle_suppression_delete(request):
-    err = _check_auth(request)
-    if err:
-        return err
     store = get_store()
     sup_id = _parse_id(request)
     if sup_id is None:
@@ -411,8 +417,9 @@ async def _handle_suppression_delete(request):
     return web.Response(text="Deleted")
 
 
-async def _start_http_server():
-    app = web.Application()
+def _build_app() -> web.Application:
+    """The HTTP API: every route behind _auth_middleware except /healthz."""
+    app = web.Application(middlewares=[_auth_middleware])
     app.router.add_get("/healthz", _handle_healthz)
     app.router.add_get("/report", _handle_report)
     app.router.add_post("/report", _handle_report)
@@ -434,7 +441,13 @@ async def _start_http_server():
     app.router.add_get("/suppressions", _handle_suppressions_list)
     app.router.add_post("/suppressions", _handle_suppression_create)
     app.router.add_delete("/suppressions/{id}", _handle_suppression_delete)
-    runner = web.AppRunner(app)
+    return app
+
+
+async def _start_http_server():
+    if not config.INTERNAL_TOKEN:
+        logger.error("HTTP API is locked: INTERNAL_TOKEN is not set - every route except /healthz returns 401")
+    runner = web.AppRunner(_build_app())
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", _HTTP_PORT)
     await site.start()

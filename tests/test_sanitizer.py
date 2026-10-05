@@ -113,6 +113,45 @@ class TestLogRedaction(unittest.TestCase):
         self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", result2)
         self.assertIn("[REDACTED]", result2)
 
+    def test_openai_api_key(self):
+        """`sk-...` tokens leaked bare (no `key=` prefix) in exception
+        messages — redacted via the provider-token pattern."""
+        key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"
+        result = redact_logs(f"Incorrect API key provided: {key}")
+        self.assertNotIn(key, result)
+        self.assertIn("[REDACTED_LLM_KEY]", result)
+
+    def test_anthropic_api_key(self):
+        key = "sk-ant-api03-" + "a" * 40
+        result = redact_logs(f"Invalid API key: {key}")
+        self.assertNotIn(key, result)
+        self.assertIn("[REDACTED_LLM_KEY]", result)
+
+    def test_google_api_key(self):
+        key = "AIza" + "a" * 35
+        result = redact_logs(f"Using credentials {key} failed")
+        self.assertNotIn(key, result)
+        self.assertIn("[REDACTED_GOOGLE_KEY]", result)
+
+    def test_slack_bot_token(self):
+        # built from parts so that secret scanners do not flag the test itself
+        token = "xox" + "b-" + "1234567890-1234567890-" + "abcdefghijklmnopqrstuvwx"
+        result = redact_logs(f"slack auth error for {token}")
+        self.assertNotIn(token, result)
+        self.assertIn("[REDACTED_SLACK_TOKEN]", result)
+
+    def test_github_pat(self):
+        pat = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        result = redact_logs(f"git push failed: token {pat} rejected")
+        self.assertNotIn(pat, result)
+        self.assertIn("[REDACTED_GH_TOKEN]", result)
+
+    def test_github_fine_grained_pat(self):
+        pat = "github_pat_" + "A1b2C3d4E5" * 3
+        result = redact_logs(f"token {pat}")
+        self.assertNotIn(pat, result)
+
+
     def test_pem_key(self):
         text = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg...\n-----END PRIVATE KEY-----"
         result = redact_logs(text)

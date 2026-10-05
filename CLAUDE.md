@@ -171,7 +171,7 @@ Port `HTTP_PORT` (default 8080):
 | `/suppressions` | POST | Token | Create suppression |
 | `/suppressions/{id}` | DELETE | Token | Delete suppression |
 
-Auth: `X-Internal-Token` header matching `INTERNAL_TOKEN` env var.
+Auth: every route except `/healthz` needs the `X-Internal-Token` header matching `INTERNAL_TOKEN` (`_auth_middleware` in `src/handlers/startup.py`). Without `INTERNAL_TOKEN` the API is locked (401). `/healthz` pings the store and returns 503 when it cannot be reached.
 
 ## Environment Variables
 
@@ -269,7 +269,7 @@ Auth: `X-Internal-Token` header matching `INTERNAL_TOKEN` env var.
 | `CENTRAL_AGGREGATE` | `false` | Enable push to central ClickHouse |
 | `CENTRAL_CH_URL` | _(empty)_ | ClickHouse HTTP URL |
 | `CENTRAL_CH_USER` | `monitor` | ClickHouse user |
-| `CENTRAL_CH_PASSWORD` | _(empty)_ | ClickHouse password (from Vault) |
+| `CENTRAL_CH_PASSWORD` | _(empty)_ | ClickHouse password (from a Secret) |
 | `CENTRAL_CH_DATABASE` | `monitor` | ClickHouse database name |
 
 ### State & Infra
@@ -277,7 +277,7 @@ Auth: `X-Internal-Token` header matching `INTERNAL_TOKEN` env var.
 |---|---|---|
 | `SQLITE_PATH` | `/data/k8s-ai-monitor.db` | SQLite DB path |
 | `PROMETHEUS_URL` | `http://prometheus-operated:9090` | Prometheus endpoint |
-| `INTERNAL_TOKEN` | _(empty)_ | Auth token for write HTTP endpoints |
+| `INTERNAL_TOKEN` | _(empty)_ | Auth token for every HTTP endpoint except `/healthz`; empty = API locked |
 | `HTTP_PORT` | `8080` | HTTP server port |
 | `DAILY_REPORT_HOUR_UTC` | `8` | Daily report hour (UTC) |
 

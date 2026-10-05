@@ -114,7 +114,8 @@ def process_scan_results(results: list, store: SqliteStore,
                     _record_silent_occurrence(store, incident, r, collect_context_fn)
                     continue
 
-            esc = check_escalation(incident)
+            # The current occurrence is recorded below, after this check.
+            esc = check_escalation(incident, count_offset=1)
             if not esc.should_alert:
                 # Still track the detection (bumps count for future escalation)
                 context = _collect_context(r, collect_context_fn)
