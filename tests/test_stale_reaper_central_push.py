@@ -67,3 +67,21 @@ def test_reaper_returns_empty_when_nothing_is_stale(store):
     """No incidents closed means no central push — not an empty-batch push."""
     _active(store, "Pod:production/fresh:mount", last_seen_at=time.time() - 60)
     assert store.cleanup() == []
+
+
+def test_reaper_closes_a_stale_acknowledged_incident(store):
+    """Acknowledged means a person owns it - not that it stays open for ever."""
+    _active(store, "Pod:production/owned:mount", last_seen_at=time.time() - 8 * 86400)
+    store._get_conn().execute(
+        "UPDATE incidents SET status = 'acknowledged' WHERE state_key = ?",
+        ("Pod:production/owned:mount",))
+    store._get_conn().commit()
+
+    reaped = store.cleanup()
+
+    assert [i.state_key for i in reaped] == ["Pod:production/owned:mount"]
+    row = store._get_conn().execute(
+        "SELECT status, resolved_by FROM incidents WHERE state_key = ?",
+        ("Pod:production/owned:mount",),
+    ).fetchone()
+    assert (row["status"], row["resolved_by"]) == ("resolved", "reaper")

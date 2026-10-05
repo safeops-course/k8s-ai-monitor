@@ -338,6 +338,29 @@ def test_deferred_auto_resolve_emits_auto_resolve_scanresult(tmp_path):
     assert results[0].state_key == "Deployment:prod/api:oom"
 
 
+def test_deferred_auto_resolve_includes_an_acknowledged_incident(tmp_path):
+    """Acknowledged during the grace delay: the owner recovered, so it still
+    gets its auto_resolve - a person owning it does not keep it open."""
+    store = SqliteStore(db_path=str(tmp_path / "t.db"))
+    inc = store.create_incident(
+        state_key="Deployment:prod/api:oom", fingerprint="fp", issue_type="oom",
+        severity="critical", namespace="prod", owner_ref="Deployment:prod/api",
+    )
+    store.set_status(inc.id, "acknowledged")
+
+    with patch("src.handlers.events._AUTO_RESOLVE_DELAY", 0), \
+         patch("src.handlers.events._is_owner_healthy", return_value=True), \
+         patch("src.handlers.events.process_scan_results") as psr, \
+         patch("src.handlers.startup.get_store", return_value=store):
+        _run(events_handler._deferred_auto_resolve(
+            [("Deployment:prod/api:oom", "prod", "Deployment:prod/api")],
+        ))
+
+    psr.assert_called_once()
+    results = psr.call_args.args[0]
+    assert [(r.state_key, r.auto_resolve) for r in results] == [("Deployment:prod/api:oom", True)]
+
+
 def test_deferred_auto_resolve_skips_unhealthy_owners(tmp_path):
     """If the owner hasn't actually recovered after the grace, no
     auto_resolve is emitted — the incident stays active for the next
