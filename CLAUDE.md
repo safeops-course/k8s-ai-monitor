@@ -157,17 +157,17 @@ Port `HTTP_PORT` (default 8080):
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/healthz` | GET | No | Health check |
-| `/report` | GET/POST | No | Trigger daily report |
-| `/state` | GET | No | View dedup state |
-| `/certs` | GET | No | Trigger cert scan |
-| `/llm-usage?hours=N` | GET | No | LLM cost/usage |
-| `/incidents` | GET | No | List incidents |
-| `/incidents/{id}` | GET | No | Incident detail |
+| `/report` | GET/POST | Token | Trigger daily report |
+| `/state` | GET | Token | View dedup state |
+| `/certs` | GET | Token | Trigger cert scan |
+| `/llm-usage?hours=N` | GET | Token | LLM cost/usage |
+| `/incidents` | GET | Token | List incidents |
+| `/incidents/{id}` | GET | Token | Incident detail |
 | `/incidents/{id}/ack` | POST | Token | Acknowledge incident |
 | `/incidents/{id}/resolve` | POST | Token | Resolve incident |
-| `/reports` | GET | No | Daily report history |
-| `/reports/{id}` | GET | No | Report detail |
-| `/suppressions` | GET | No | List suppressions |
+| `/reports` | GET | Token | Daily report history |
+| `/reports/{id}` | GET | Token | Report detail |
+| `/suppressions` | GET | Token | List suppressions |
 | `/suppressions` | POST | Token | Create suppression |
 | `/suppressions/{id}` | DELETE | Token | Delete suppression |
 
@@ -361,7 +361,7 @@ python -m src.cli audit --ns production --pod storefront
 
 ## Deployment
 
-Deployed via FluxCD. Image: `ghcr.io/ldbl/k8s-ai-monitor:latest`.
+Deployed via FluxCD from the platform repository (`safeops-course/sre`, `flux/infrastructure/observability/k8s-ai-monitor/`). Image: `ghcr.io/safeops-course/k8s-ai-monitor`.
 
 ## MCP Server
 
