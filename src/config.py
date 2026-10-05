@@ -633,8 +633,6 @@ CENTRAL_CH_USER = os.environ.get("CENTRAL_CH_USER", "monitor")
 CENTRAL_CH_PASSWORD = os.environ.get("CENTRAL_CH_PASSWORD", "")
 CENTRAL_CH_DATABASE = os.environ.get("CENTRAL_CH_DATABASE", "monitor")
 
-# Fleet dashboard (reads the central ClickHouse)
-DASHBOARD_PORT = parse_env_int("DASHBOARD_PORT", 8080, min_value=1, max_value=65535)
 
 _SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "flux-system", "gmp-system", "gmp-public"}
 

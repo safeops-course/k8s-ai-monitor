@@ -135,7 +135,6 @@ unless the course says so.
 | `CENTRAL_CH_USER` | `"monitor"` |  |
 | `CENTRAL_CH_PASSWORD` | `""` |  |
 | `CENTRAL_CH_DATABASE` | `"monitor"` |  |
-| `DASHBOARD_PORT` | `8080` | Fleet dashboard (reads the central ClickHouse) |
 | `ALERT_EXCLUDE_WORKLOADS` | `""` | Workload exclusion — skip alerts for specific workloads (substring match on state_key/owner_key) |
 | `REOPEN_PROVENANCE_ENABLED` | `"false"` | A scanner-resolved incident that reopens does not force a Slack post on its own. |
 | `HOURLY_DIGEST_ENABLED` | `"false"` | Post withheld alerts as one grouped message on an interval - and nothing at all when there is nothing to say. |
