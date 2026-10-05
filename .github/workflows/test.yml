@@ -22,7 +22,8 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -r requirements.txt pytest ruff
+        # Pinned like the pre-commit hook: a new release must not fail CI on unchanged code.
+        run: pip install -r requirements.txt pytest==9.1.1 ruff==0.15.20
 
       - name: Ruff
         run: ruff check .

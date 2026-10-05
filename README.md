@@ -159,7 +159,7 @@ The entry point runs: `kopf run --standalone --all-namespaces src/handlers/__ini
 |---|---|---|
 | `SQLITE_PATH` | `/data/k8s-ai-monitor.db` | SQLite DB path |
 | `PROMETHEUS_URL` | `http://prometheus-operated:9090` | Prometheus endpoint |
-| `INTERNAL_TOKEN` | _(empty)_ | Auth token for write HTTP endpoints |
+| `INTERNAL_TOKEN` | _(empty)_ | Auth token for every HTTP endpoint except `/healthz`; empty = API locked |
 | `HTTP_PORT` | `8080` | HTTP server port |
 | `DAILY_REPORT_HOUR_UTC` | `8` | Daily report hour (UTC) |
 

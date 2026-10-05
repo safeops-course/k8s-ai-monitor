@@ -123,6 +123,12 @@ CREATE TABLE IF NOT EXISTS maintenance_log (
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_log_created ON maintenance_log(created_at);
 
+-- One row, written and rolled back by ping(): proves the store is writable.
+CREATE TABLE IF NOT EXISTS store_health (
+    id INTEGER PRIMARY KEY,
+    checked_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
 CREATE INDEX IF NOT EXISTS idx_incidents_owner_ref ON incidents(owner_ref);
 CREATE INDEX IF NOT EXISTS idx_occurrences_incident ON incident_occurrences(incident_id);
@@ -142,10 +148,21 @@ class SqliteStore:
         logger.info("SQLite store initialized: %s", self._db_path)
 
     def ping(self) -> None:
-        """Raise if the database cannot be reached - /healthz uses it. A trivial SELECT
-        also opens the thread-local connection, so "unable to open database file"
-        surfaces here instead of looking healthy."""
-        self._get_conn().execute("SELECT 1").fetchone()
+        """Raise unless the existing database can be read AND written - /healthz uses it.
+
+        A fresh connection in mode=rw: it never creates a missing file (a cached
+        connection, or a plain connect, would open or create one and look healthy).
+        It reads a real table, then writes one row and rolls it back - a store that
+        went read-only (disk full, read-only remount) fails here. SELECT 1 passes on both.
+        """
+        conn = sqlite3.connect(f"file:{self._db_path}?mode=rw", uri=True, timeout=5)
+        try:
+            conn.execute("SELECT 1 FROM incidents LIMIT 1").fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR REPLACE INTO store_health (id, checked_at) VALUES (1, ?)", (time.time(),))
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (sqlite3 connections are not thread-safe)."""

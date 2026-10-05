@@ -140,6 +140,19 @@ class TestLogRedaction(unittest.TestCase):
         self.assertNotIn(token, result)
         self.assertIn("[REDACTED_SLACK_TOKEN]", result)
 
+    def test_slack_app_token(self):
+        token = "xa" + "pp-1-" + "A0123456789-1234567890123-" + "abcdef0123456789"
+        result = redact_logs(f"socket mode failed with {token}")
+        self.assertNotIn(token, result)
+        self.assertIn("[REDACTED_SLACK_TOKEN]", result)
+
+    def test_slack_rotated_app_token(self):
+        token = "xo" + "xe.xapp-1-" + "A0123456789-1234567890123-" + "abcdef0123456789"
+        result = redact_logs(f"refresh returned {token}")
+        self.assertNotIn(token, result)
+        self.assertNotIn("xapp-1-A0123456789", result)
+        self.assertIn("[REDACTED_SLACK_TOKEN]", result)
+
     def test_github_pat(self):
         pat = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
         result = redact_logs(f"git push failed: token {pat} rejected")
