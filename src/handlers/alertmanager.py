@@ -20,6 +20,7 @@ import logging
 
 from aiohttp import web
 
+from src.engine.sanitizer import sanitize_value
 from src.scanners._base import ScanResult
 
 logger = logging.getLogger(__name__)
@@ -40,9 +41,12 @@ def _watched(namespace: str) -> bool:
 
 
 def alert_to_result(alert: dict) -> ScanResult | None:
-    """One Alertmanager alert -> one ScanResult, or None when it is not ours to track."""
+    """One Alertmanager alert -> one ScanResult, or None when it is not ours to track.
+    Raises ValueError for a malformed alert (labels or annotations that are not objects)."""
     labels = alert.get("labels") or {}
     annotations = alert.get("annotations") or {}
+    if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        raise ValueError("alert labels and annotations must be objects")
     alertname = labels.get("alertname", "")
     if not alertname or alertname in IGNORED_ALERTS:
         return None
@@ -72,7 +76,8 @@ def alert_to_result(alert: dict) -> ScanResult | None:
     }
     return ScanResult(
         state_key=f"Alert:{scope}/{alertname}:{fingerprint or 'none'}",
-        title=annotations.get("summary") or f"Alert {alertname}",
+        # The title goes to Slack as is (the pipeline sanitizes the context, not the title)
+        title=sanitize_value(annotations.get("summary") or f"Alert {alertname}"),
         severity=severity,
         resource=f"Alert/{alertname}",
         namespace=namespace,
@@ -87,7 +92,10 @@ def alert_to_result(alert: dict) -> ScanResult | None:
 
 
 def payload_to_results(payload: dict) -> list[ScanResult]:
-    """The alerts of one webhook payload that become ScanResults."""
+    """The alerts of one webhook payload that become ScanResults.
+    Raises ValueError when the payload is not an object with an 'alerts' list."""
+    if not isinstance(payload, dict):
+        raise ValueError("payload is not a JSON object")
     alerts = payload.get("alerts")
     if not isinstance(alerts, list):
         raise ValueError("payload has no 'alerts' list")
@@ -112,7 +120,7 @@ async def handle_alertmanager_webhook(request: web.Request) -> web.Response:
         logger.warning("Alertmanager webhook: bad payload: %s", e)
         return web.Response(text=f"bad payload: {e}", status=400)
 
-    received = len(payload.get("alerts", []))
+    received = len(payload["alerts"])  # payload_to_results checked it is a list
     if not results:
         return web.json_response({"received": received, "processed": 0})
 

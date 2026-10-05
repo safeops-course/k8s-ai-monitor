@@ -49,10 +49,10 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(?:ghp|ghs|gho|ghu|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED_GH_TOKEN]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED_GH_PAT]"),
     # JSON-style secrets: "password": "value" - the quote after the key name keeps
-    # the key=value pattern below from matching it.
+    # the key=value pattern below from matching it. The value may hold escaped quotes (\").
     (re.compile(
         r'(?i)("(?:[A-Za-z0-9_.-]*?)(?:password|passwd|secret|token|api[-_]?key|apikey|'
-        r'credentials?|private[-_]?key|access[-_]?key)(?:[A-Za-z0-9_.-]*)"\s*:\s*)"[^"]*"'),
+        r'credentials?|private[-_]?key|access[-_]?key)(?:[A-Za-z0-9_.-]*)"\s*:\s*)"(?:[^"\\]|\\.)*"'),
      r'\1"[REDACTED]"'),
     # Key=value secrets (password, api_key, token, secret, etc.)
     (re.compile(

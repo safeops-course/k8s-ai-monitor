@@ -461,3 +461,8 @@ class TestStructuredSecrets(unittest.TestCase):
         self.assertNotIn("demo-value", out)
         self.assertNotIn("x y", out)
         self.assertIn('"user": "bob"', out)
+
+    def test_json_text_secret_with_escaped_quote_is_fully_redacted(self):
+        out = redact_logs('{"password": "abc\\"tail-part", "user": "bob"}')
+        self.assertNotIn("tail-part", out)
+        self.assertIn('"user": "bob"', out)

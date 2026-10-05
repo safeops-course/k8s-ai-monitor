@@ -58,6 +58,20 @@ class TestAlertToResult(unittest.TestCase):
         with self.assertRaises(ValueError):
             alertmanager.payload_to_results({"status": "firing"})
 
+    def test_payload_that_is_not_an_object_is_refused(self):
+        with self.assertRaises(ValueError):
+            alertmanager.payload_to_results(["not", "an", "object"])
+
+    def test_malformed_labels_are_refused(self):
+        with self.assertRaises(ValueError):
+            alertmanager.alert_to_result({"labels": ["alertname"], "status": "firing"})
+
+    def test_secret_in_summary_is_redacted_from_the_title(self):
+        alert = _alert()
+        alert["annotations"]["summary"] = "login failed, password=" + "hunter" + "2-demo"
+        r = alertmanager.alert_to_result(alert)
+        self.assertNotIn("hunter2-demo", r.title)
+
 
 class TestNamespaceFilter(unittest.TestCase):
     def test_unwatched_namespace_is_dropped(self):
@@ -99,6 +113,14 @@ class TestWebhookRoute(unittest.IsolatedAsyncioTestCase):
             resp = await client.post("/alertmanager", data="not json",
                                      headers={"X-Internal-Token": "s3cret"})
             self.assertEqual(resp.status, 400)
+
+    async def test_json_that_is_not_an_object_is_a_400(self):
+        with mock.patch.object(config, "INTERNAL_TOKEN", "s3cret"):
+            client = await self._client()
+            for body in ("[]", '{"alerts": [{"labels": "x"}]}'):
+                resp = await client.post("/alertmanager", data=body,
+                                         headers={"X-Internal-Token": "s3cret"})
+                self.assertEqual(resp.status, 400, body)
 
 
 if __name__ == "__main__":
