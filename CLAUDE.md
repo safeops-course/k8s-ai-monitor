@@ -107,6 +107,10 @@ SQLite database at `SQLITE_PATH` with tables: `incidents`, `incident_occurrences
 
 `NON_PROD_NAMESPACES` — monitored, never sent to the LLM: incidents are tracked, fingerprinted and posted with their collected context to `SLACK_WEBHOOK_URL_NONPROD`, with 2x debounce. The LLM cost is kept for production.
 
+Without an API key for `LLM_PROVIDER` (`llm.llm_configured()`), every incident takes the non-prod
+path: tracked, fingerprinted and posted with its collected context, never analysed; the daily and
+weekly reports (LLM summaries) are skipped with a warning. The course runs it that way on kind.
+
 System namespaces (`kube-system`, `kube-public`, `kube-node-lease`, `flux-system`) are always excluded when `WATCH_ALL_NAMESPACES=true`.
 
 ### Deduplication Layers

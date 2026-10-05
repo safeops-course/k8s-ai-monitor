@@ -136,6 +136,38 @@ class TestWebhookRoute(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp.status, 400, body)
 
 
+class TestWithoutAnLLMKey(unittest.TestCase):
+    """kind without a key: a production incident is tracked and posted, not analysed."""
+
+    def test_production_alert_is_posted_without_analysis(self):
+        import tempfile
+
+        from src.engine import pipeline
+        from src.engine.store.sqlite import SqliteStore
+
+        store = SqliteStore(tempfile.mkdtemp() + "/t.db")
+        with mock.patch("src.handlers.events._in_watched_namespace", return_value=True), \
+             mock.patch("src.engine.pipeline.llm_configured", return_value=False), \
+             mock.patch("src.engine.pipeline.analyze_alert") as llm, \
+             mock.patch("src.engine.pipeline.post_alert", return_value=True) as post:
+            pipeline.process_scan_results(alertmanager.payload_to_results({"alerts": [_alert()]}), store)
+            llm.assert_not_called()
+            post.assert_called_once()
+            self.assertEqual(store.get_incident(
+                "Alert:production/BackendErrorBudgetBurnFast:abc123").status, "active")
+
+    def test_llm_configured_follows_the_provider_key(self):
+        from src.engine import llm
+        cases = [("openai", {"OPENAI_API_KEY": "k"}, True), ("openai", {"GEMINI_API_KEY": "k"}, False),
+                 ("gemini", {"GEMINI_API_KEY": "k"}, True), ("anthropic", {"ANTHROPIC_API_KEY": "k"}, True),
+                 ("anthropic", {}, False)]
+        for provider, keys, expected in cases:
+            env = {"OPENAI_API_KEY": "", "GEMINI_API_KEY": "", "ANTHROPIC_API_KEY": "", **keys}
+            with mock.patch.object(config, "LLM_PROVIDER", provider), \
+                 mock.patch.multiple(config, **env):
+                self.assertEqual(llm.llm_configured(), expected, (provider, keys))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -154,6 +186,7 @@ class TestThroughThePipeline(unittest.TestCase):
         analysis = AnalysisResult(raw_text="{}", parsed={"root_cause": "x"}, parse_error=False,
                                   model="test", tokens_in=1, tokens_out=1, cost_usd=0.0)
         with mock.patch("src.handlers.events._in_watched_namespace", return_value=True), \
+             mock.patch("src.engine.pipeline.llm_configured", return_value=True), \
              mock.patch("src.engine.pipeline.analyze_alert", return_value=analysis) as llm, \
              mock.patch("src.engine.pipeline.post_alert", return_value=True):
             pipeline.process_scan_results(alertmanager.payload_to_results({"alerts": [_alert()]}), store)

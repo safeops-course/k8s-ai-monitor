@@ -6,7 +6,7 @@ import time
 from src import config
 from src.collectors import Collector
 from src.engine import central_push
-from src.engine.llm import analyze_daily_report, analyze_weekly_report
+from src.engine.llm import analyze_daily_report, analyze_weekly_report, llm_configured
 from src.engine.sanitizer import sanitize_dict
 from src.engine.notifier import post_daily_report, post_weekly_report
 
@@ -51,6 +51,10 @@ def run_daily_report(*, suppress_error_output: bool = False) -> bool:
     intermediate attempt. The final attempt is run with this False so a
     genuine, sustained outage is still surfaced.
     """
+    if not llm_configured():
+        # Not an outage to retry: the report is an LLM summary, and there is no key.
+        logger.warning("Daily report skipped: no API key for LLM_PROVIDER=%s", config.LLM_PROVIDER)
+        return True
     if not _daily_report_lock.acquire(blocking=False):
         logger.warning("Daily report already in progress — skipping concurrent run")
         return False
@@ -81,6 +85,9 @@ def run_daily_report(*, suppress_error_output: bool = False) -> bool:
 
 
 def run_weekly_report():
+    if not llm_configured():
+        logger.warning("Weekly report skipped: no API key for LLM_PROVIDER=%s", config.LLM_PROVIDER)
+        return
     logger.info("Generating weekly report")
     from src.collectors.daily import collect_weekly_data
     data = collect_weekly_data()

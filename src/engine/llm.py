@@ -519,6 +519,14 @@ def _get_client_cached(provider: str):
         return "anthropic", anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, timeout=60.0)
 
 
+def llm_configured() -> bool:
+    """True when the key of LLM_PROVIDER is set. Without it the monitor still detects,
+    tracks and posts incidents (with their collected context), but analyses nothing and
+    writes no daily or weekly report - the course runs on kind without a key."""
+    keys = {"openai": config.OPENAI_API_KEY, "gemini": config.GEMINI_API_KEY}
+    return bool(keys.get(config.LLM_PROVIDER, config.ANTHROPIC_API_KEY))
+
+
 def _get_client():
     """Legacy wrapper so all existing call sites keep their zero-arg signature.
     The cached version keyed by provider is the actual worker."""

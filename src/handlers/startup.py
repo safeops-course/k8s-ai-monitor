@@ -24,7 +24,7 @@ from src.collectors import Collector
 from src.collectors.node import get_node_metrics_summary
 from src.collectors.app_metrics import get_app_metrics_summary
 from src.reporter import run_daily_report, run_weekly_report
-from src.engine.llm import _get_client, _get_model
+from src.engine.llm import _get_client, _get_model, llm_configured
 
 logger = logging.getLogger(__name__)
 
@@ -1100,46 +1100,14 @@ def _startup_cleanup(store):
         logger.info("Startup cleanup: resolved %d stale/non-prod incidents", resolved)
 
 
-@kopf.on.startup()
-async def on_startup(settings: kopf.OperatorSettings, **kwargs):
-    settings.watching.server_timeout = 600
-    # The monitor only reads the cluster: no Kubernetes Events of its own (kopf posts its
-    # per-object log lines as Events by default, which needs events create - not granted).
-    settings.posting.enabled = False
-
-    # Apply LOG_LEVEL to kopf's internal loggers (they ignore basicConfig)
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    for name in ("kopf.activities", "httpcore", "httpx", "anthropic", "kubernetes"):
-        logging.getLogger(name).setLevel(log_level)
-    # kopf.objects is very noisy (logs every handler success), keep at WARNING
-    logging.getLogger("kopf.objects").setLevel("WARNING")
-
-    try:
-        k8s_config.load_incluster_config()
-    except k8s_config.ConfigException:
-        k8s_config.load_kube_config()
-
-    logger.info(
-        "k8s-ai-monitor starting - cluster=%s, namespaces=%s, exclude_ns=%s, provider=%s, scanner_interval=%ds",
-        config.CLUSTER_NAME, "*" if config.WATCH_ALL_NAMESPACES else config.NAMESPACES,
-        config.EXCLUDE_NAMESPACES or "(none)",
-        config.LLM_PROVIDER, config.SCANNER_INTERVAL_SECONDS,
-    )
-
-    # Prometheus connectivity check
-    if config.PROMETHEUS_URL:
-        try:
-            resp = requests.get(f"{config.PROMETHEUS_URL}/api/v1/status/buildinfo", timeout=5)
-            if resp.status_code == 200:
-                version = resp.json().get("data", {}).get("version", "?")
-                logger.info("Prometheus reachable at %s (version %s)", config.PROMETHEUS_URL, version)
-            else:
-                logger.warning("Prometheus at %s returned HTTP %s", config.PROMETHEUS_URL, resp.status_code)
-        except Exception as e:
-            logger.warning("Prometheus at %s is NOT reachable: %s", config.PROMETHEUS_URL, e)
-    else:
-        logger.warning("PROMETHEUS_URL not set — node metrics will use Metrics API only")
-    # LLM connectivity check
+def _check_llm() -> None:
+    """One tiny LLM call at startup, so a bad key or model shows in the log at once.
+    Without a key there is nothing to test: say what the monitor does without one."""
+    if not llm_configured():
+        logger.warning("LLM not configured (no API key for LLM_PROVIDER=%s): incidents are tracked "
+                       "and posted with their context, without analysis; no daily/weekly report",
+                       config.LLM_PROVIDER)
+        return
     try:
         provider, client = _get_client()
         alert_model = _get_model(provider, "alert")
@@ -1180,6 +1148,48 @@ async def on_startup(settings: kopf.OperatorSettings, **kwargs):
                          (resp.usage.input_tokens + resp.usage.output_tokens) if resp.usage else 0)
     except Exception as e:
         logger.error("LLM check FAILED for provider=%s: %s", config.LLM_PROVIDER, e)
+
+
+@kopf.on.startup()
+async def on_startup(settings: kopf.OperatorSettings, **kwargs):
+    settings.watching.server_timeout = 600
+    # The monitor only reads the cluster: no Kubernetes Events of its own (kopf posts its
+    # per-object log lines as Events by default, which needs events create - not granted).
+    settings.posting.enabled = False
+
+    # Apply LOG_LEVEL to kopf's internal loggers (they ignore basicConfig)
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    for name in ("kopf.activities", "httpcore", "httpx", "anthropic", "kubernetes"):
+        logging.getLogger(name).setLevel(log_level)
+    # kopf.objects is very noisy (logs every handler success), keep at WARNING
+    logging.getLogger("kopf.objects").setLevel("WARNING")
+
+    try:
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        k8s_config.load_kube_config()
+
+    logger.info(
+        "k8s-ai-monitor starting - cluster=%s, namespaces=%s, exclude_ns=%s, provider=%s, scanner_interval=%ds",
+        config.CLUSTER_NAME, "*" if config.WATCH_ALL_NAMESPACES else config.NAMESPACES,
+        config.EXCLUDE_NAMESPACES or "(none)",
+        config.LLM_PROVIDER, config.SCANNER_INTERVAL_SECONDS,
+    )
+
+    # Prometheus connectivity check
+    if config.PROMETHEUS_URL:
+        try:
+            resp = requests.get(f"{config.PROMETHEUS_URL}/api/v1/status/buildinfo", timeout=5)
+            if resp.status_code == 200:
+                version = resp.json().get("data", {}).get("version", "?")
+                logger.info("Prometheus reachable at %s (version %s)", config.PROMETHEUS_URL, version)
+            else:
+                logger.warning("Prometheus at %s returned HTTP %s", config.PROMETHEUS_URL, resp.status_code)
+        except Exception as e:
+            logger.warning("Prometheus at %s is NOT reachable: %s", config.PROMETHEUS_URL, e)
+    else:
+        logger.warning("PROMETHEUS_URL not set — node metrics will use Metrics API only")
+    _check_llm()
 
     logger.info("HTTP auth: %s", "enabled (INTERNAL_TOKEN set)" if config.INTERNAL_TOKEN else "disabled")
     logger.info("State backend: sqlite (%s)", config.SQLITE_PATH)
