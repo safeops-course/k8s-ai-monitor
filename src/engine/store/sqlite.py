@@ -826,14 +826,16 @@ class SqliteStore:
         return [dict(r) for r in rows]
 
     def get_active_incidents_by_prefix(self, prefixes: list[str]) -> list[Incident]:
-        """Return active incidents whose state_key starts with any of the given prefixes."""
+        """Return open (active or acknowledged) incidents whose state_key starts with any of the
+        given prefixes - the ones a scanner may close once their cause is gone."""
         if not prefixes:
             return []
         conn = self._get_conn()
         conditions = " OR ".join("state_key LIKE ?" for _ in prefixes)
         params = [f"{p}%" for p in prefixes]
         rows = conn.execute(
-            f"SELECT * FROM incidents WHERE status = 'active' AND ({conditions})",
+            # Open = active or acknowledged: an owned incident still closes when its cause goes.
+            f"SELECT * FROM incidents WHERE status IN ('active', 'acknowledged') AND ({conditions})",
             params,
         ).fetchall()
         return [self._row_to_incident(r) for r in rows]
@@ -936,7 +938,7 @@ class SqliteStore:
         cur = conn.execute(
             "UPDATE incidents SET status = 'resolved', updated_at = ?, "
             "resolved_by = 'reaper' "
-            "WHERE status = 'active' AND last_seen_at < ? "
+            "WHERE status IN ('active', 'acknowledged') AND last_seen_at < ? "
             "RETURNING *",
             (time.time(), stale_cutoff),
         )

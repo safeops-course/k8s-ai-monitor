@@ -136,6 +136,37 @@ class TestWebhookRoute(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp.status, 400, body)
 
 
+class TestAcknowledgedStillCloses(unittest.TestCase):
+    """Found on kind: an acknowledged incident stayed open after its alert resolved."""
+
+    def test_resolved_alert_closes_an_acknowledged_incident(self):
+        from src.engine import pipeline
+        from src.engine.store.sqlite import SqliteStore
+
+        store = SqliteStore(":memory:")
+        with mock.patch("src.handlers.events._in_watched_namespace", return_value=True), \
+             mock.patch("src.engine.pipeline.llm_configured", return_value=False), \
+             mock.patch("src.engine.pipeline.post_alert", return_value=True):
+            pipeline.process_scan_results(alertmanager.payload_to_results({"alerts": [_alert()]}), store)
+            inc = store.get_incident("Alert:production/BackendErrorBudgetBurnFast:abc123")
+            store.set_status(inc.id, "acknowledged")
+            pipeline.process_scan_results(
+                alertmanager.payload_to_results({"alerts": [_alert(status="resolved")]}), store)
+            self.assertEqual(store.get_incident(inc.state_key).status, "resolved")
+
+    def test_open_incidents_by_prefix_include_acknowledged(self):
+        from src.engine.store.sqlite import SqliteStore
+
+        store = SqliteStore(":memory:")
+        a = store.create_incident(state_key="Node:n1:notready", fingerprint="f1", issue_type="node",
+                                  severity="critical", namespace="", owner_ref="")
+        b = store.create_incident(state_key="Node:n2:notready", fingerprint="f2", issue_type="node",
+                                  severity="critical", namespace="", owner_ref="")
+        store.set_status(b.id, "acknowledged")
+        found = {i.id for i in store.get_active_incidents_by_prefix(["Node:"])}
+        self.assertEqual(found, {a.id, b.id})
+
+
 class TestWithoutAnLLMKey(unittest.TestCase):
     """kind without a key: a production incident is tracked and posted, not analysed."""
 
