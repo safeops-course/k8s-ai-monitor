@@ -295,7 +295,9 @@ def process_scan_results(results: list, store: SqliteStore,
         # Auto-resolve path — always process even in maintenance
         if r.auto_resolve:
             existing = store.get_incident(r.state_key)
-            if existing and existing.status == "active":
+            # Acknowledged means a person owns it - not that it stays open once the
+            # cause is gone (a resolved alert, a healthy scan).
+            if existing and existing.status in ("active", "acknowledged"):
                 if not store.set_status(existing.id, "resolved"):
                     # Row disappeared mid-flight (e.g. manual delete via CLI).
                     # Don't emit resolved Slack or ClickHouse push — the

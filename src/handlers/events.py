@@ -93,7 +93,7 @@ async def _deferred_auto_resolve(alerted: list[tuple[str, str, str]]):
     for state_key, namespace, owner_key in alerted:
         try:
             incident = await loop.run_in_executor(None, store.get_incident, state_key)
-            if not incident or incident.status != "active":
+            if not incident or incident.status not in ("active", "acknowledged"):
                 continue
             healthy = await loop.run_in_executor(None, _is_owner_healthy, owner_key, namespace)
             if not healthy:
