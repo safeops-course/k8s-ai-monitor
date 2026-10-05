@@ -227,10 +227,13 @@ Cluster: {cluster_name}"""
 _call_timestamps: deque[float] = deque()
 _rate_lock = threading.Lock()
 
-# Pricing per million tokens: {model_prefix: (input_$/MTok, output_$/MTok)}
-# Gemini 3.1 prices are for ≤200k token contexts (standard tier). Above 200k,
-# input doubles and output rises ~50% — not modeled here, we stay within 200k.
+# Pricing per million tokens: {model_prefix: (input_$/MTok, output_$/MTok)}, standard
+# tier, from the providers' pricing pages (checked 2026-10-05). The longest matching
+# prefix wins, so "gemini-3.5-flash-lite" is never priced as "gemini-3.5-flash".
+# Long-context surcharges (Gemini Pro >200k, OpenAI >272k) are not modeled.
 _MODEL_PRICING = {
+    "claude-opus-5-5":            (4.0, 20.0),
+    "claude-sonnet-5-5":          (2.0, 10.0),
     "claude-opus-4":              (5.0, 25.0),
     "claude-sonnet-4":            (3.0, 15.0),
     "claude-haiku-4":             (1.0, 5.0),
@@ -240,9 +243,16 @@ _MODEL_PRICING = {
     "gpt-4.1-nano":               (0.1, 0.4),
     "gpt-5-mini":                 (0.25, 2.0),
     "gpt-5.2":                    (1.75, 14.0),
+    "gpt-6-luna":                 (0.10, 0.50),
+    "gpt-6.1-sol":                (2.0, 10.0),
     "gemini-3.1-pro":             (2.0, 12.0),
     "gemini-3.1-flash-lite":      (0.25, 1.5),
-    "gemini-3.1-flash":           (0.30, 2.5),  # placeholder until official pricing confirmed
+    "gemini-3.5-flash-lite":      (0.30, 2.5),
+    "gemini-3.5-flash":           (1.50, 9.0),
+    # 3.6-3.8 Flash: 0.75 / 3.75 until 2026-12-31, then 1.50 / 7.50 - update in January.
+    "gemini-3.6-flash":           (0.75, 3.75),
+    "gemini-3.7-flash":           (0.75, 3.75),
+    "gemini-3.8-flash":           (0.75, 3.75),
 }
 
 # Structured JSON parsing defaults.
@@ -538,20 +548,26 @@ def _get_model(provider: str, tier: str = "alert") -> str:
         return config.LLM_MODEL_REPORT
     if tier == "alert" and config.LLM_MODEL:
         return config.LLM_MODEL
+    # Defaults (checked 2026-10-05): a cheap, fast model per incident, a stronger one for the
+    # daily/weekly report. Stable models only - previews get shut down (LLM_MODEL overrides).
     if provider == "gemini":
-        # Flash for reports (good reasoning with CoT, much cheaper than Pro).
-        # Flash-Lite for alerts (cheapest, fastest).
-        return "gemini-3-flash-preview" if tier == "report" else "gemini-3.1-flash-lite-preview"
+        return "gemini-3.8-flash" if tier == "report" else "gemini-3.5-flash-lite"
     if tier == "report":
-        return "gpt-5.2" if provider == "openai" else "claude-sonnet-4-5-20250929"
-    return "gpt-5-mini" if provider == "openai" else "claude-haiku-4-5-20251001"
+        return "gpt-6.1-sol" if provider == "openai" else "claude-sonnet-5-5"
+    # Haiku 4.5 retires not sooner than 2026-10-15 and has no successor yet - revisit then.
+    return "gpt-6-luna" if provider == "openai" else "claude-haiku-4-5-20251001"
+
+
+def _openai_token_param(model: str) -> str:
+    """GPT-4 and older take max_tokens; GPT-5 and later require max_completion_tokens."""
+    return "max_tokens" if model.startswith(("gpt-3", "gpt-4")) else "max_completion_tokens"
 
 
 def _estimate_cost(model: str, input_tokens: int | None, output_tokens: int | None,
                     flex: bool = False) -> float | None:
     if input_tokens is None or output_tokens is None:
         return 0.0 if model in ("sonnet", "opus", "haiku") else None
-    for prefix, (inp_price, out_price) in _MODEL_PRICING.items():
+    for prefix, (inp_price, out_price) in sorted(_MODEL_PRICING.items(), key=lambda kv: -len(kv[0])):
         if model.startswith(prefix):
             cost = (input_tokens * inp_price + output_tokens * out_price) / 1_000_000
             if flex:
@@ -634,9 +650,7 @@ def _call_llm(provider: str, client, model: str, system: str, user_content: str,
     t0 = time.monotonic()
     cached_tokens = 0
     if provider == "openai":
-        # GPT-5+ models require max_completion_tokens instead of max_tokens
-        token_param = ("max_completion_tokens" if model.startswith("gpt-5")
-                       else "max_tokens")
+        token_param = _openai_token_param(model)
         resp = client.chat.completions.create(
             model=model,
             messages=[

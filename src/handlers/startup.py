@@ -24,7 +24,7 @@ from src.collectors import Collector
 from src.collectors.node import get_node_metrics_summary
 from src.collectors.app_metrics import get_app_metrics_summary
 from src.reporter import run_daily_report, run_weekly_report
-from src.engine.llm import _get_client, _get_model, llm_configured
+from src.engine.llm import _get_client, _get_model, _openai_token_param, llm_configured
 
 logger = logging.getLogger(__name__)
 
@@ -1115,8 +1115,7 @@ def _check_llm() -> None:
         logger.info("LLM provider=%s, alert_model=%s, report_model=%s — testing...",
                      provider, alert_model, report_model)
         if provider == "openai":
-            token_param = ("max_completion_tokens" if alert_model.startswith("gpt-5")
-                           else "max_tokens")
+            token_param = _openai_token_param(alert_model)
             resp = client.chat.completions.create(
                 model=alert_model,
                 messages=[{"role": "user", "content": "Reply with just: ok"}],
