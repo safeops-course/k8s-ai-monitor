@@ -1032,9 +1032,32 @@ class CriticalEndpointScanner:
     name = "critical_endpoint"
     startup_delay = 15
 
+    def __init__(self) -> None:
+        # Consecutive failed / healthy probe cycles per state_key (_flap_gate).
+        self._fail_streak: dict[str, int] = {}
+        self._ok_streak: dict[str, int] = {}
+
     @property
     def enabled(self):
         return config.SCANNER_CRITICAL_ENDPOINT_ENABLED
+
+    def _flap_gate(self, state_key: str, healthy: bool) -> str | None:
+        """Hysteresis across scan cycles: "down", "recovered" or None (say nothing).
+
+        An endpoint that flaps (fail, ok, fail, ok - e.g. during a node upgrade) used
+        to open and close an incident every cycle: one healthy probe emitted
+        Recovered, the next failure a new Down. Now Down needs
+        CRITICAL_ENDPOINT_DOWN_CYCLES failed cycles in a row, and Recovered needs
+        CRITICAL_ENDPOINT_RECOVER_CYCLES healthy cycles in a row. Once reached, the
+        decision repeats every cycle (the pipeline deduplicates repeated Downs).
+        """
+        if healthy:
+            self._fail_streak[state_key] = 0
+            self._ok_streak[state_key] = self._ok_streak.get(state_key, 0) + 1
+            return "recovered" if self._ok_streak[state_key] >= config.CRITICAL_ENDPOINT_RECOVER_CYCLES else None
+        self._ok_streak[state_key] = 0
+        self._fail_streak[state_key] = self._fail_streak.get(state_key, 0) + 1
+        return "down" if self._fail_streak[state_key] >= config.CRITICAL_ENDPOINT_DOWN_CYCLES else None
 
     @property
     def interval_seconds(self):
@@ -1097,27 +1120,32 @@ class CriticalEndpointScanner:
                     ext_status = f"external={'OK' if ext_ok_flag else external_probe.status_code or external_probe.reason}, "
                 logger.info("Chain %s/%s (%s): %s%s", ns, ir_name, host, ext_status, hop_summary)
 
-                if all_healthy:
-                    # Also check external and cluster IP probes
-                    ext_ok = (
-                        external_probe is None
-                        or (external_probe.status_code is not None and 200 <= external_probe.status_code <= 399)
-                    )
-                    cip_ok = (
-                        cluster_ip_probe is None
-                        or (cluster_ip_probe.status_code is not None and 200 <= cluster_ip_probe.status_code <= 399)
-                    )
-                    if ext_ok and cip_ok:
-                        results.append(ScanResult(
-                            state_key=state_key,
-                            title=f"Critical Endpoint Recovered: {host}",
-                            severity="info",
-                            resource=f"IngressRoute/{ir_name}",
-                            namespace=ns,
-                            issue_type="critical_endpoint",
-                            auto_resolve=True,
-                        ))
-                        continue
+                # Healthy = every hop, plus the external and cluster IP probes.
+                ext_ok = (
+                    external_probe is None
+                    or (external_probe.status_code is not None and 200 <= external_probe.status_code <= 399)
+                )
+                cip_ok = (
+                    cluster_ip_probe is None
+                    or (cluster_ip_probe.status_code is not None and 200 <= cluster_ip_probe.status_code <= 399)
+                )
+                healthy = all_healthy and ext_ok and cip_ok
+                decision = self._flap_gate(state_key, healthy)
+                if decision is None:
+                    logger.info("Chain %s/%s: %s, inside the flap window - no decision this cycle",
+                                ns, ir_name, "healthy" if healthy else "failing")
+                    continue
+                if decision == "recovered":
+                    results.append(ScanResult(
+                        state_key=state_key,
+                        title=f"Critical Endpoint Recovered: {host}",
+                        severity="info",
+                        resource=f"IngressRoute/{ir_name}",
+                        namespace=ns,
+                        issue_type="critical_endpoint",
+                        auto_resolve=True,
+                    ))
+                    continue
 
                 # Something is unhealthy — build context
                 failing_names = [h.name for h in hops if not h.healthy]

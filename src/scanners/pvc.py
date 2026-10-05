@@ -3,6 +3,7 @@ import logging
 
 from src import config
 from src.collectors import Collector
+from src.collectors._formatters import fmt_bytes
 from src.scanners._base import ScanResult
 
 logger = logging.getLogger(__name__)
@@ -34,12 +35,25 @@ class PvcScanner:
             if a["namespace"] in config.EXCLUDE_NAMESPACES:
                 continue
             pct = a["pct"] * 100
-            context = (
-                f"## PVC Alert\n"
-                f"PVC: {a['namespace']}/{a['pvc']}\n"
-                f"Usage: {pct:.1f}% ({a['used']} / {a['capacity']})\n"
-                f"Severity: {a['severity']}\n"
-            )
+            context_lines = [
+                "## PVC Alert",
+                f"PVC: {a['namespace']}/{a['pvc']}",
+                f"Usage: {pct:.1f}% ({a['used']} / {a['capacity']})",
+                f"Severity: {a['severity']}",
+            ]
+            growth_per_day = a.get("growth_per_day")
+            days_to_full = a.get("days_to_full")
+            if growth_per_day is not None:
+                context_lines.append(
+                    f"Growth (24h avg): {fmt_bytes(growth_per_day)}/day"
+                )
+                if days_to_full is not None:
+                    if days_to_full < 1:
+                        eta = f"{days_to_full * 24:.1f}h"
+                    else:
+                        eta = f"{days_to_full:.1f}d"
+                    context_lines.append(f"Projected days-to-full: {eta}")
+            context = "\n".join(context_lines) + "\n"
             state_key = f"PVC:{a['namespace']}/{a['pvc']}:{a['severity']}"
             problem_keys.add(state_key)
             results.append(ScanResult(

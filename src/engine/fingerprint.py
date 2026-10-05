@@ -16,6 +16,15 @@ STABLE_SIGNATURES: dict[str, Callable[[dict], str]] = {
     "certificate":  lambda m: str(m.get("issue") or "?")[:80],
     "pvc":          lambda m: m.get("severity", "?"),
     "endpoint":     lambda m: str(m.get("url") or "?")[:80],
+    # Keyed on the ceiling, so raising maxReplicas opens a fresh incident rather
+    # than reopening the old one. "Still saturated after the ceiling moved" is a
+    # different fact from "still saturated at the number nobody has touched".
+    "hpa":          lambda m: f"max={m.get('max_replicas', '?')}",
+    # Keyed on the threshold, not the SLI name alone — the name is already in
+    # the state_key. Moving a threshold is a decision, and the breach that
+    # follows it is a different fact from the one that preceded it, so it
+    # deserves its own incident rather than reopening the old one.
+    "sli_breach":   lambda m: f"{m.get('sli_name', '?')}@{m.get('threshold', '?')}",
 }
 
 

@@ -158,9 +158,9 @@ class TestBuildAlertPayload(unittest.TestCase):
 
     def test_valid_json_output(self):
         data = self._make_data()
-        json_str, _, _ = build_alert_payload(data, "production/Pod/my-app", "test-cluster", 24000)
+        json_str, _, _ = build_alert_payload(data, "production/Pod/my-app", "example", 24000)
         parsed = json.loads(json_str)
-        self.assertEqual(parsed["cluster"], "test-cluster")
+        self.assertEqual(parsed["cluster"], "example")
         self.assertEqual(parsed["resource"], "production/Pod/my-app")
         self.assertIn("pod", parsed)
 
@@ -203,11 +203,64 @@ class TestBuildAlertPayload(unittest.TestCase):
         self.assertEqual(notes, [])
 
     def test_progressive_trim_under_tight_cap(self):
-        """With very tight cap, sections are progressively dropped."""
+        """With very tight cap, logs are progressively trimmed; structured
+        sections are preserved even if the result stays over budget."""
         data = self._make_data()
         json_str, truncated, notes = build_alert_payload(data, "res", "cluster", 2000)
         self.assertTrue(truncated)
-        self.assertLessEqual(len(json_str.encode("utf-8")), 2000)
+        parsed = json.loads(json_str)
+        # Structured sections must remain — they're the LLM's root-cause signal.
+        self.assertIn("pod", parsed)
+        self.assertIn("owner", parsed)
+        self.assertIn("node_metrics", parsed)
+        self.assertIn("diagnostics", parsed)
+        self.assertIn("events", parsed)
+
+    def test_trim_preserves_diagnostics_when_logs_fit_budget(self):
+        """If dropping / trimming logs brings us under the cap, the structured
+        sections all survive untouched."""
+        # Oversized log section forces the trim loop; cap is large enough that
+        # the structured sections themselves fit comfortably, so the only
+        # thing that needs to shrink is `logs`.
+        data = self._make_data(log_count=500)
+        # Tight cap so even the 30-line-capped log section pushes us over,
+        # but structured sections alone fit comfortably.
+        json_str, truncated, notes = build_alert_payload(data, "res", "cluster", 2800)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(json_str.encode("utf-8")), 2800)
+        parsed = json.loads(json_str)
+        self.assertIn("diagnostics", parsed)
+        self.assertIn("node_metrics", parsed)
+        self.assertIn("events", parsed)
+        self.assertIn("owner", parsed)
+        self.assertIn("pod", parsed)
+
+    def test_trim_never_drops_structured_sections(self):
+        """Synthetic payload that stays over budget even after dropping logs
+        entirely — we still return pod/owner/events/diagnostics intact."""
+        data = self._make_data()
+        # Force the structured sections to exceed an absurdly tight cap.
+        json_str, truncated, notes = build_alert_payload(data, "res", "cluster", 500)
+        self.assertTrue(truncated)
+        parsed = json.loads(json_str)
+        # Even though the payload is over budget, the structured sections
+        # survive — the OVER_BUDGET note is added but nothing else is dropped.
+        self.assertIn("pod", parsed)
+        self.assertIn("diagnostics", parsed)
+        self.assertIn("node_metrics", parsed)
+        self.assertIn("events", parsed)
+        self.assertIn("owner", parsed)
+        self.assertNotIn("logs", parsed)
+        self.assertTrue(any("OVER_BUDGET" in n for n in notes))
+
+    def test_initial_log_cap_is_30_lines(self):
+        """Under a generous budget the log section is capped at 30 lines."""
+        data = self._make_data(log_count=200)
+        json_str, _, notes = build_alert_payload(data, "res", "cluster", 80000)
+        parsed = json.loads(json_str)
+        # 30 retained + 1 omission marker line
+        self.assertLessEqual(len(parsed["logs"]), 31)
+        self.assertTrue(any("-> 30" in n for n in notes))
 
     def test_flux_context(self):
         data = {

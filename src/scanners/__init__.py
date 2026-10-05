@@ -22,6 +22,9 @@ def _discover_scanners() -> list:
                 if (
                     isinstance(obj, type)
                     and obj.__module__ == mod.__name__
+                    and hasattr(obj, "name")
+                    and hasattr(obj, "scan")
+                    and hasattr(obj, "collect_daily_data")
                 ):
                     try:
                         instance = obj()

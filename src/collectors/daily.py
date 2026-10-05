@@ -11,12 +11,85 @@ from src.collectors.prometheus import prom_scalar, prom_query
 logger = logging.getLogger(__name__)
 
 
+def _extract_current_snapshot(raw_context: dict, issue_type: str) -> dict | None:
+    """Pull the most signal-rich fields out of a stored raw_context dict,
+    keyed by incident issue_type.
+
+    Returns a small dict the daily LLM can compare against the initial
+    analysis — or None when no useful fields are present. Used by the daily
+    report enrichment; the LLM uses it to decide whether an incident is
+    stable or evolving.
+    """
+    if not isinstance(raw_context, dict):
+        return None
+
+    # Pod-level incidents (crash, oom, unhealthy, error, mount, image_pull,
+    # scheduling, evicted) share the same collector output shape.
+    pod_issue_types = {
+        "crash", "oom", "unhealthy", "error", "mount", "image_pull", "image-pull",
+        "scheduling", "evicted",
+    }
+    if issue_type in pod_issue_types:
+        pod = raw_context.get("pod")
+        if not isinstance(pod, dict):
+            return None
+        containers = pod.get("containers") or []
+        first = containers[0] if containers and isinstance(containers[0], dict) else {}
+        pod_snap: dict = {
+            "phase": pod.get("phase", ""),
+            "ready": pod.get("node_ready"),
+            "restart_count": first.get("restarts"),
+            "last_reason": first.get("reason") or first.get("last_reason") or "",
+            "last_exit_code": first.get("exit_code"),
+        }
+        return {k: v for k, v in pod_snap.items() if v is not None and v != ""} or None
+
+    if issue_type in ("endpoint", "critical_endpoint"):
+        ctx = raw_context.get("context") or raw_context.get("raw") or ""
+        snap: dict = {}
+        if isinstance(ctx, str):
+            snap["context"] = ctx[:300]
+        for k in ("url", "status_code", "reason", "http_status", "status"):
+            if k in raw_context:
+                snap[k] = raw_context[k]
+        return snap or None
+
+    if issue_type in ("pvc", "pvc_usage"):
+        snap = {}
+        for k in ("usage_pct", "free_bytes", "namespace", "pvc"):
+            if k in raw_context:
+                snap[k] = raw_context[k]
+        return snap or None
+
+    if issue_type in ("certificate", "cert"):
+        snap = {}
+        for k in ("days_until_expiry", "error", "status"):
+            if k in raw_context:
+                snap[k] = raw_context[k]
+        return snap or None
+
+    if issue_type.startswith("flux") or "flux_resource" in raw_context:
+        snap = {}
+        conds = raw_context.get("conditions") or []
+        if isinstance(conds, list) and conds:
+            c0 = conds[0] if isinstance(conds[0], dict) else {}
+            if c0.get("message"):
+                snap["condition_message"] = str(c0["message"])[:300]
+        fres = raw_context.get("flux_resource")
+        if isinstance(fres, dict):
+            for k in ("generation", "last_applied_revision"):
+                if k in fres:
+                    snap[k] = fres[k]
+        return snap or None
+
+    return None
+
+
 def collect_daily_data() -> dict:
     core = k8s.CoreV1Api()
     custom = k8s.CustomObjectsApi()
     result = {
         "pod_restarts": [],
-        "pod_restarts_older": [],
         "warning_events": [],
         "flux_failures": [],
         "node_issues": [],
@@ -26,7 +99,9 @@ def collect_daily_data() -> dict:
         "resource_pressure": [],
     }
 
-    for ns in config.get_namespaces():
+    result["error_log_patterns"] = _collect_error_log_patterns(config.get_prod_namespaces())
+
+    for ns in config.get_prod_namespaces():
         # Pod restarts — only include pods with recent restarts (last 24h)
         try:
             pods = core.list_namespaced_pod(ns)
@@ -64,10 +139,11 @@ def collect_daily_data() -> dict:
                     }
                     if age_h is not None:
                         entry["hours_since_last_restart"] = round(age_h, 1)
+                    # Only last-24h restarts belong in the DAILY report. Restarts
+                    # older than 24h (or undateable) are the weekly report's job —
+                    # the daily report focuses on the past day only.
                     if recent:
                         result["pod_restarts"].append(entry)
-                    else:
-                        result["pod_restarts_older"].append(entry)
         except Exception:
             logger.debug("Failed to list pods in %s", ns)
 
@@ -100,13 +176,21 @@ def collect_daily_data() -> dict:
                 obj_ns = obj["metadata"].get("namespace")
                 if not obj_ns or obj_ns in config.EXCLUDE_NAMESPACES:
                     continue
+                if obj_ns in config.NON_PROD_NAMESPACES:
+                    continue
                 conditions = obj.get("status", {}).get("conditions", [])
                 for c in conditions:
-                    if c["type"] == "Ready" and c["status"] != "True":
+                    # Only Ready=False is an actual failure. Ready=Unknown means
+                    # the object is mid-reconcile (reason Progressing/Reconciling/
+                    # DependencyNotReady) — a normal transient state that flips to
+                    # True in seconds, so it must not be reported as an issue. A
+                    # genuinely stuck reconcile eventually times out to Ready=False.
+                    if c["type"] == "Ready" and c["status"] == "False":
                         result["flux_failures"].append({
                             "kind": kind,
                             "namespace": obj["metadata"]["namespace"],
                             "name": obj["metadata"]["name"],
+                            "reason": c.get("reason", ""),
                             "message": c.get("message", "Not Ready"),
                         })
         except Exception:
@@ -260,9 +344,10 @@ def collect_weekly_data() -> dict:
     except Exception:
         logger.debug("Failed to collect daily reports for weekly summary", exc_info=True)
 
-    # b) 7 days of incidents — aggregate by type and severity
+    # b) 7 days of incidents — aggregate by type and severity (prod only)
     try:
-        raw = store.get_recent_incidents(168)  # 7 * 24
+        raw = store.get_recent_prod_incidents(
+            168, exclude_namespaces=config.NON_PROD_NAMESPACES)  # 7 * 24
         for inc in raw:
             itype = inc.get("issue_type", "unknown")
             sev = inc.get("severity", "unknown")
@@ -274,6 +359,13 @@ def collect_weekly_data() -> dict:
                 "severity": sev,
                 "status": inc.get("status", "active"),
                 "occurrences": inc.get("occurrence_count", 1),
+                # Wall-clock span first_seen→last_seen. For continuously
+                # re-detected issues (scheduling, persistent unhealthy) this is
+                # far more meaningful than occurrences, which is just the number
+                # of scan cycles that re-saw the same problem.
+                "duration_hours": round(
+                    (inc["last_seen_at"] - inc["first_seen_at"]) / 3600, 1
+                ),
                 "first_seen": datetime.fromtimestamp(
                     inc["first_seen_at"], tz=timezone.utc
                 ).isoformat(),
@@ -298,6 +390,63 @@ def collect_weekly_data() -> dict:
     return result
 
 
+def _collect_error_log_patterns(namespaces: list[str], since_minutes: int = 1440,
+                                  max_per_ns: int = 5000, top_n: int = 10) -> list[dict]:
+    """Aggregate top error log patterns per namespace/container from ES.
+
+    Paginates through up to ``max_per_ns`` matching errors per namespace in
+    the window so the top-N counts reflect the full window, not just the most
+    recent slice.
+
+    Returns list of {namespace, container, pattern, count} sorted by count desc.
+    No-op when ES is not configured.
+    """
+    from src.collectors.elasticsearch import search_error_logs
+    from src.engine.sanitizer import redact_logs
+    import re
+
+    patterns: list[dict] = []
+    for ns in namespaces:
+        hits = search_error_logs(
+            ns, since_minutes=since_minutes,
+            limit=1000, max_total=max_per_ns,
+        )
+        if hits is None:
+            logger.debug("ES error log query failed for %s", ns)
+            continue
+        if not hits:
+            continue
+        # Normalize message: strip timestamps, UUIDs, numbers so similar errors cluster
+        counts: dict[tuple[str, str], int] = {}
+        for h in hits:
+            msg = (h.get("message") or "").strip()
+            if not msg:
+                continue
+            # Redact passwords/tokens BEFORE normalization so secrets never
+            # reach the LLM context, even if the regex below would otherwise
+            # mask them.
+            msg = redact_logs(msg)
+            norm = re.sub(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', '<uuid>', msg, flags=re.I)
+            norm = re.sub(r'\b\d{10,}\b', '<ts>', norm)  # epoch timestamps
+            norm = re.sub(r'\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\S*', '<iso>', norm)
+            norm = re.sub(r'\b\d+\b', '<n>', norm)
+            norm = norm[:200]
+            key = (h.get("container") or "-", norm)
+            counts[key] = counts.get(key, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        for (container, pattern), count in top:
+            patterns.append({
+                "namespace": ns,
+                "container": container,
+                "pattern": pattern,
+                "count": count,
+            })
+    # Global sort across all namespaces so the most frequent patterns appear
+    # first regardless of which namespace produced them — matches the docstring.
+    patterns.sort(key=lambda p: p["count"], reverse=True)
+    return patterns
+
+
 def _collect_scanner_daily_data() -> list[str]:
     """Collect daily data sections from enabled scanners."""
     from src.scanners import get_enabled_scanners
@@ -317,11 +466,13 @@ def _collect_24h_history() -> dict:
     """Collect 24-hour history from SQLite incidents and Prometheus metrics."""
     result = {}
 
-    # a) Incidents from SQLite
+    # a) Incidents from SQLite, enriched with latest occurrence context.
+    # Non-prod namespaces are filtered out — daily reports are production-only.
     try:
         from src.handlers.startup import get_store
         store = get_store()
-        raw = store.get_recent_incidents(24)
+        raw = store.get_recent_prod_incidents(
+            24, exclude_namespaces=config.NON_PROD_NAMESPACES)
         if raw:
             result["incidents"] = [
                 {
@@ -336,15 +487,82 @@ def _collect_24h_history() -> dict:
                     "last_seen": datetime.fromtimestamp(
                         r["last_seen_at"], tz=timezone.utc
                     ).isoformat(),
+                    "_last_seen_ts": r["last_seen_at"],
                 }
                 for r in raw
             ]
+
+            # Enrich each incident with:
+            #   - `initial_analysis`: the first LLM diagnosis of this incident
+            #      in the 24h window (reuse root_cause / hypotheses / actions
+            #      instead of re-deriving them).
+            #   - `repetition`: how many times it fired after that analysis,
+            #      and for how long — tells the LLM whether the suggested
+            #      actions have obviously not been applied.
+            #   - `current_snapshot`: most recent observed state, so the LLM
+            #      can detect evolution vs. a static recurrence.
+            # Per-incident try/except so one bad row doesn't blank the rest.
+            for inc_entry in result["incidents"][:30]:
+                try:
+                    first = store.get_first_analysis_by_state_key(
+                        inc_entry["state_key"], max_age_hours=24)
+                    if first and isinstance(first.get("analysis_json"), dict):
+                        parsed = first["analysis_json"]
+                        analyzed_at = datetime.fromtimestamp(
+                            first["seen_at"], tz=timezone.utc,
+                        ).isoformat()
+                        inc_entry["initial_analysis"] = {
+                            "reasoning": parsed.get("reasoning", ""),
+                            "root_cause": parsed.get("root_cause", ""),
+                            "confidence": parsed.get("confidence"),
+                            "severity": parsed.get("severity"),
+                            "hypotheses": (parsed.get("hypotheses") or [])[:3],
+                            "impact": parsed.get("impact", ""),
+                            "suggested_actions": (parsed.get("suggested_actions") or [])[:3],
+                            "analyzed_at": analyzed_at,
+                            "analyzed_by": first.get("llm_model", ""),
+                        }
+                        duration_s = max(0.0, inc_entry["_last_seen_ts"] - first["seen_at"])
+                        # Count actual occurrences since the analyzed one
+                        count_since = store.count_occurrences_since(
+                            inc_entry["state_key"], since_ts=first["seen_at"]
+                        )
+                        # Subtract 1 to get count *after* the initial one
+                        count_since = max(0, count_since - 1)
+                        note = (
+                            f"Initial LLM analysis at {analyzed_at}; "
+                            f"incident recurred {count_since} times without re-analysis"
+                            if count_since > 0
+                            else "Single occurrence so far"
+                        )
+                        inc_entry["repetition"] = {
+                            "count_since_initial": count_since,
+                            "duration_minutes": round(duration_s / 60, 1),
+                            "note": note,
+                        }
+
+                    latest = store.get_latest_raw_context_by_state_key(
+                        inc_entry["state_key"], max_age_hours=24)
+                    if latest and latest.get("raw_context"):
+                        parsed_raw = latest["raw_context"]
+                        if isinstance(parsed_raw, dict):
+                            snap = _extract_current_snapshot(
+                                parsed_raw, inc_entry["issue_type"])
+                            if snap:
+                                inc_entry["current_snapshot"] = snap
+                except (AttributeError, KeyError, ValueError):
+                    logger.warning("Failed to enrich incident %s with AI analysis",
+                                   inc_entry.get("state_key", "?"), exc_info=True)
+
+            # Strip internal sort keys before the data reaches the LLM payload.
+            for inc_entry in result["incidents"]:
+                inc_entry.pop("_last_seen_ts", None)
     except Exception:
         logger.debug("Failed to collect 24h incidents from SQLite", exc_info=True)
 
     # b) Pod restarts in last 24h from Prometheus
     try:
-        ns_list = config.get_namespaces()
+        ns_list = config.get_prod_namespaces()
         if ns_list and config.PROMETHEUS_URL:
             ns_regex = "|".join(ns_list)
             raw = prom_query(
@@ -367,7 +585,7 @@ def _collect_24h_history() -> dict:
 
     # c) OOMKill events in last 24h from Prometheus
     try:
-        ns_list = config.get_namespaces()
+        ns_list = config.get_prod_namespaces()
         if ns_list and config.PROMETHEUS_URL:
             ns_regex = "|".join(ns_list)
             raw = prom_query(

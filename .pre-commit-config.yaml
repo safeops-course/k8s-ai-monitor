@@ -26,6 +26,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: config-doc
+        name: docs/configuration.md matches src/config.py
+        entry: python3 scripts/gen-config-doc.py --check
+        language: system
+        files: ^(src/config\.py|scripts/gen-config-doc\.py|docs/configuration\.md)$
+        pass_filenames: false
+
       - id: pytest
         name: pytest (whole suite - a change in src/ can break any test)
         entry: python -m pytest tests/ -q

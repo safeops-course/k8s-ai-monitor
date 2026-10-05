@@ -32,12 +32,14 @@ reviews:
         - `enabled` must come from a config.py env var; new scanners that probe the network or read secrets default to "false". reconcile.py is always on by design.
         - state_key must be deterministic and unique. Do not change the format of an existing scanner's key (dedup and auto-resolve of open incidents depend on it); new scanners follow the pattern of the closest existing one (e.g. `Certificate:{ns}/{name}`). Healthy state must emit ScanResult(auto_resolve=True).
         - Respect config.EXCLUDE_NAMESPACES / config.get_namespaces().
-        - backup.py covers CNPG, backup CronJobs, Percona and S3/GCS verification; the once-per-day storage check guard is backup.py _last_storage_check_date (storage_verify.py holds only the S3/GCS clients).
+        - backup.py covers CloudNativePG only: the latest Backup of each ScheduledBackup, and recoverability from the Cluster's status.lastSuccessfulBackup. It reads no Secrets.
+        - critical_endpoint.py: Traefik IngressRoute discovery; Down/Recovered decisions go through _flap_gate (CRITICAL_ENDPOINT_DOWN_CYCLES / RECOVER_CYCLES).
         - HTTP probe bodies and log lines must go through sanitizer.redact_response_body before entering alert context.
     - path: "src/engine/**"
       instructions: |
         - pipeline.py is shared by every detection source; check dedup (in-flight set, store cooldown, context hash) is not bypassed.
-        - Cooldown backoff lives in pipeline.py (`min(debounce * 2**min(count,10), 43200)`) and store/sqlite.py mark_seen; flag changes that make the two diverge. escalation.py only picks recurring/persistent levels.
+        - Cooldown backoff lives in pipeline.py only (`min(base * 2**min(count,10), _max_cooldown(...))`, tiered by critical.py). escalation.py only picks recurring/persistent levels; the pipeline passes count_offset=1 because it checks before recording the occurrence.
+        - LLM: production incidents only - non-prod and maintenance set skip_llm. Providers: anthropic, openai, gemini.
         - llm.py: every analyze_* entry point must sanitize_dict() the context, pass _check_rate_limit(), and truncate via context_budget.py to MAX_CONTEXT_BYTES_ALERT/REPORT before calling the provider.
         - sanitizer.py: new patterns must not stop redacting existing credential formats covered by tests/test_sanitizer.py.
         - notifier.py: Slack Block Kit limits (50 blocks, 3000 chars per section text); LLM output is untrusted text.

@@ -1,4 +1,17 @@
-"""Flux Kustomization/HelmRelease handlers — extracted from handlers.py."""
+"""Flux Kustomization/HelmRelease handlers — extracted from handlers.py.
+
+Sprint 9 — migrated to the shared pipeline. Stalled conditions emit a
+`ScanResult` that flows through `process_scan_results`, so flux alerts
+now get fingerprinting, escalation, enrichment, root-cause correlation
+and Slack threading — features the direct `post_alert` path bypassed.
+
+Kopf-specific concerns stay here: startup grace, `_in_flight` dedup
+across concurrent kopf invocations for the same CR, and the CR-level
+namespace filters. Context collection (`collect_flux_context`) is also
+still done in the handler; the dict is handed to the pipeline via
+`ScanResult.context_override` so the pipeline doesn't try to collect
+pod context for a non-pod resource.
+"""
 import asyncio
 import logging
 import time
@@ -6,18 +19,21 @@ import time
 import kopf
 
 from src import config
-from src.engine.llm import analyze_alert
-from src.engine.notifier import post_alert, format_structured_analysis, get_webhook_for_namespace
 from src.collectors import Collector
-from src.collectors.node import get_node_metrics_summary
 from src.collectors.app_metrics import get_app_metrics_summary
+from src.collectors.node import get_node_metrics_summary
+from src.engine.pipeline import process_scan_results
+from src.scanners._base import ScanResult
 
 logger = logging.getLogger(__name__)
 
 _startup_time = time.time()
 _STARTUP_GRACE_SECONDS = 30
 
-# In-flight state keys to prevent duplicate concurrent alerts
+# In-flight state keys to prevent duplicate concurrent alerts.
+# Covers the whole processing window (context collection + pipeline
+# invocation) so a duplicate kopf event for the same CR skips work the
+# pipeline would anyway de-dedupe via incident cooldown.
 _in_flight: set[str] = set()
 
 _collector: Collector | None = None
@@ -28,35 +44,6 @@ def _get_collector() -> Collector:
     if _collector is None:
         _collector = Collector()
     return _collector
-
-
-async def _analyze_and_alert(title: str, resource: str, namespace: str,
-                              context_fn, severity: str, event_reason: str = "",
-                              node: str = "", pod_name: str = ""):
-    loop = asyncio.get_running_loop()
-    if config.is_nonprod_namespace(namespace):
-        analysis_text = title
-        title = f"{config.nonprod_title_prefix(namespace)} {title}"
-        model = ""
-    else:
-        context = await loop.run_in_executor(None, context_fn)
-        res_label = f"{namespace}/{resource}"
-        ar = await loop.run_in_executor(None, analyze_alert, context, res_label)
-        analysis_text = format_structured_analysis(ar.parsed) if ar.parsed and not ar.parse_error else ar.raw_text
-        if not analysis_text or not analysis_text.strip():
-            analysis_text = "Analysis unavailable"
-        model = ar.model
-    node_metrics = ""
-    if node:
-        node_metrics = await loop.run_in_executor(None, get_node_metrics_summary, node)
-    app_metrics = ""
-    if pod_name:
-        app_metrics = await loop.run_in_executor(None, get_app_metrics_summary, pod_name, namespace)
-    webhook_url = get_webhook_for_namespace(namespace)
-    await loop.run_in_executor(
-        None, lambda: post_alert(title, analysis_text, severity, resource, namespace, event_reason, node, node_metrics,
-                                 app_metrics, model, webhook_url=webhook_url),
-    )
 
 
 @kopf.on.event("kustomizations", group="kustomize.toolkit.fluxcd.io", version="v1")
@@ -70,6 +57,12 @@ async def on_helmrelease_event(event, logger, **kwargs):
 
 
 async def _handle_flux_event(event, kind: str, logger):
+    """Handle Flux Kustomization/HelmRelease stalled events.
+
+    Like `events.py`, this handler bypasses the hot/cold router on purpose:
+    Flux stalls block deployments and need immediate surface-level alerting
+    regardless of the hot/cold batching policy that scanners go through.
+    """
     if event.get("type") is None:
         return
     if time.time() - _startup_time < _STARTUP_GRACE_SECONDS:
@@ -82,14 +75,15 @@ async def _handle_flux_event(event, kind: str, logger):
     name = obj.get("metadata", {}).get("name", "")
     namespace = obj.get("metadata", {}).get("namespace", "")
 
-    # Respect EXCLUDE_NAMESPACES / WATCH_NAMESPACES
+    # Respect EXCLUDE_NAMESPACES / WATCH_NAMESPACES / NON_PROD_SCANNER_ENABLED
     if namespace in config.EXCLUDE_NAMESPACES:
+        return
+    if config.is_nonprod_namespace(namespace) and not config.NON_PROD_SCANNER_ENABLED:
         return
     if not config.WATCH_ALL_NAMESPACES and namespace not in config.NAMESPACES:
         return
 
     conditions = obj.get("status", {}).get("conditions", [])
-
     cond_map = {c.get("type"): c for c in conditions}
     stalled = cond_map.get("Stalled", {})
     if stalled.get("status") != "True":
@@ -105,21 +99,51 @@ async def _handle_flux_event(event, kind: str, logger):
     _in_flight.add(state_key)
 
     try:
-        if await asyncio.get_running_loop().run_in_executor(None, store.is_seen, state_key):
+        loop = asyncio.get_running_loop()
+
+        # Respect maintenance mode — skip emission entirely, same as the
+        # pod event handler in events.py. Previously flux.py had no such
+        # check (confirmed by v4 SRE review).
+        if await loop.run_in_executor(None, store.is_maintenance_active):
+            logger.debug(
+                "Flux %s stall ignored during maintenance: %s/%s",
+                kind, namespace, name,
+            )
             return
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: store.mark_seen(state_key, issue_type="stalled"),
+
+        message = stalled.get("message", "")
+        logger.info("Flux %s stalled: %s/%s \u2014 %s", kind, namespace, name, message)
+
+        collector = _get_collector()
+        flux_context = await loop.run_in_executor(
+            None, collector.collect_flux_context, name, namespace, kind,
+        )
+
+        result = ScanResult(
+            state_key=state_key,
+            title=f"Flux {kind} Stalled",
+            severity="critical",
+            resource=f"{kind}/{name}",
+            namespace=namespace,
+            issue_type="stalled",
+            context_override=flux_context,
+            event_reason="Stalled",
+            skip_llm=True,
+            metadata={"kind": kind, "name": name},
+        )
+
+        # Pipeline handles: fingerprinting, dedup/cooldown, escalation,
+        # enrichment, root-cause correlation, Slack post + threading,
+        # central ClickHouse push. collect_context_fn stays None because
+        # context_override is already set — the pipeline uses it as-is
+        # instead of attempting pod-context collection.
+        await loop.run_in_executor(
+            None,
+            lambda: process_scan_results(
+                [result], store, None,
+                get_node_metrics_summary,
+                get_app_metrics_summary,
+            ),
         )
     finally:
         _in_flight.discard(state_key)
-
-    message = stalled.get("message", "")
-    logger.info("Flux %s stalled: %s/%s \u2014 %s", kind, namespace, name, message)
-    collector = _get_collector()
-    await _analyze_and_alert(
-        title=f"Flux {kind} Stalled",
-        resource=f"{kind}/{name}",
-        namespace=namespace,
-        context_fn=lambda n=name, ns=namespace, k=kind: collector.collect_flux_context(n, ns, k),
-        severity="warning",
-    )

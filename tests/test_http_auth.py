@@ -41,13 +41,13 @@ class TestHttpAuth(unittest.IsolatedAsyncioTestCase):
 
     async def test_healthz_needs_no_token_and_pings_the_store(self):
         with mock.patch.object(config, "INTERNAL_TOKEN", ""), \
-             mock.patch.object(startup, "get_store", return_value=_FakeStore()):
+             mock.patch.object(startup, "_store", _FakeStore()):
             client = await self._client()
             resp = await client.get("/healthz")
             self.assertEqual(resp.status, 200)
 
     async def test_healthz_unhealthy_when_store_fails(self):
-        with mock.patch.object(startup, "get_store", return_value=_FakeStore(ok=False)):
+        with mock.patch.object(startup, "_store", _FakeStore(ok=False)):
             client = await self._client()
             resp = await client.get("/healthz")
             self.assertEqual(resp.status, 503)
