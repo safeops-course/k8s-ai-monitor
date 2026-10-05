@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 
 STABLE_SIGNATURES: dict[str, Callable[[dict], str]] = {
+    "alert":        lambda m: m.get("alertname", "?"),
     "crash":        lambda m: f"exit={m.get('exit_code', '?')}",
     "oom":          lambda m: "OOMKilled",
     "image-pull":   lambda m: str(m.get("image") or "?")[:80],

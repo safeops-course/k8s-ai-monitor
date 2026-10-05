@@ -439,3 +439,25 @@ class TestSanitizeValue(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStructuredSecrets(unittest.TestCase):
+    """Secrets in structured data: by key name in dicts, and JSON-style in text."""
+
+    def test_dict_value_under_a_secret_key_is_redacted(self):
+        out = sanitize_dict({"password": "demo-value", "nested": {"api_key": "abc123xyz"}})
+        self.assertEqual(out["password"], "[REDACTED]")
+        self.assertEqual(out["nested"]["api_key"], "[REDACTED]")
+
+    def test_numbers_under_token_keys_are_not_secrets(self):
+        out = sanitize_dict({"tokens_in": 120, "tokens_out": 30})
+        self.assertEqual(out, {"tokens_in": 120, "tokens_out": 30})
+
+    def test_ordinary_keys_untouched(self):
+        self.assertEqual(sanitize_dict({"message": "ok", "user": "bob"}), {"message": "ok", "user": "bob"})
+
+    def test_json_text_secret_is_redacted(self):
+        out = redact_logs('{"password": "demo-value", "client_secret" : "x y", "user": "bob"}')
+        self.assertNotIn("demo-value", out)
+        self.assertNotIn("x y", out)
+        self.assertIn('"user": "bob"', out)

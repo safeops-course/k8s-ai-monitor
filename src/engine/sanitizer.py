@@ -48,6 +48,12 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     # GitHub personal access tokens: "ghp_...", "ghs_...", "github_pat_..."
     (re.compile(r"\b(?:ghp|ghs|gho|ghu|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED_GH_TOKEN]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED_GH_PAT]"),
+    # JSON-style secrets: "password": "value" - the quote after the key name keeps
+    # the key=value pattern below from matching it.
+    (re.compile(
+        r'(?i)("(?:[A-Za-z0-9_.-]*?)(?:password|passwd|secret|token|api[-_]?key|apikey|'
+        r'credentials?|private[-_]?key|access[-_]?key)(?:[A-Za-z0-9_.-]*)"\s*:\s*)"[^"]*"'),
+     r'\1"[REDACTED]"'),
     # Key=value secrets (password, api_key, token, secret, etc.)
     (re.compile(
         r"(?i)((?:password|passwd|api_key|apikey|api[-_]?secret|secret[-_]?key|"
@@ -130,10 +136,23 @@ def sanitize_value(text: str) -> str:
     return text
 
 
+# A dict key that names a secret: its string value is replaced whatever it looks like.
+# Only string values - numbers under such keys (e.g. LLM token counts) are not secrets.
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(password|passwd|secret|token|api[-_]?key|apikey|credentials?|"
+    r"private[-_]?key|access[-_]?key)"
+)
+
+
 def sanitize_dict(data):
-    """Recursively sanitize string values in a dict/list structure."""
+    """Recursively sanitize a dict/list structure: string values by pattern, and any
+    string under a key that names a secret (password, token, api_key, ...) entirely."""
     if isinstance(data, dict):
-        return {k: sanitize_dict(v) for k, v in data.items()}
+        return {
+            k: ("[REDACTED]" if isinstance(v, str) and v and isinstance(k, str) and _SENSITIVE_KEY_RE.search(k)
+                else sanitize_dict(v))
+            for k, v in data.items()
+        }
     elif isinstance(data, list):
         return [sanitize_dict(item) for item in data]
     elif isinstance(data, str):

@@ -1,5 +1,6 @@
 """Startup, cleanup, HTTP server, scanner loops — extracted from main.py."""
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from src import config
+from src.handlers.alertmanager import handle_alertmanager_webhook
 from src.engine.notifier import post_maintenance_notice
 from src.engine import central_push
 from src.engine.store.sqlite import SqliteStore
@@ -85,8 +87,14 @@ def _check_auth(request) -> web.Response | None:
             text="HTTP API disabled: set INTERNAL_TOKEN env var",
             status=401,
         )
+    # X-Internal-Token, or "Authorization: Bearer <token>" - the form Alertmanager's
+    # webhook http_config can send. Compared in constant time.
     token = request.headers.get("X-Internal-Token", "")
-    if token != config.INTERNAL_TOKEN:
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):].strip()
+    if not hmac.compare_digest(token.encode(), config.INTERNAL_TOKEN.encode()):
         return web.Response(text="Forbidden", status=403)
     return None
 
@@ -489,6 +497,7 @@ def _build_app() -> web.Application:
     """The HTTP API: every route behind _auth_middleware except /healthz."""
     app = web.Application(middlewares=[_auth_middleware])
     app.router.add_get("/healthz", _handle_healthz)
+    app.router.add_post("/alertmanager", handle_alertmanager_webhook)
     app.router.add_get("/report", _handle_report)
     app.router.add_post("/report", _handle_report)
     app.router.add_get("/state", _handle_state)
