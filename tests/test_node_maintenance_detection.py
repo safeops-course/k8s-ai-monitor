@@ -2,9 +2,9 @@
 
 A node the cluster autoscaler is removing is cordoned (SchedulingDisabled) and
 goes NotReady while it is deleted — the same two facts a maintenance drain
-shows. On kilo this fired "Maintenance Mode Activated" for a single
-scale-down node, which silences LLM analysis and prefixes every alert
-[Maintenance] fleet-wide. The discriminator is the taint the autoscaler sets
+shows. This fired "Maintenance Mode Activated" for a single scale-down
+node, which silences LLM analysis and prefixes every alert [Maintenance]
+cluster-wide. The discriminator is the taint the autoscaler sets
 before draining.
 """
 from types import SimpleNamespace

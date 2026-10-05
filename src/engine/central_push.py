@@ -98,7 +98,7 @@ def push_incident_status(inc, status: str, resolved_by: str = "") -> None:
 
     The pipeline pushes rich snapshots on scan events, but resolves that happen
     OUTSIDE the pipeline (Slack/API resolve, startup sweeps, disabled-scanner
-    sweeps) previously never reached the central ClickHouse — the fleet board
+    sweeps) previously never reached the central ClickHouse — the central board
     kept them "open" forever. Central identity is (cluster, state_key) with the
     latest pushed_at winning; resource/title are not stored on the local
     incident row and go empty (resolved rows are filtered off the open board).
@@ -165,7 +165,7 @@ def _central_open_keys() -> list[str] | None:
 
 
 def sync_resolved_to_central(store) -> int:
-    """Close on the fleet board what the local store has already resolved.
+    """Close on the central board what the local store has already resolved.
 
     Every resolve pushes once, fire-and-forget: async_insert without waiting,
     a 10s timeout, no retry. A push lost to a blip leaves the incident "open"

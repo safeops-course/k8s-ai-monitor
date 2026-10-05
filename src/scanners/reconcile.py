@@ -54,9 +54,8 @@ _FLUX_RESOURCES: dict[str, tuple[str, str, str]] = {
 
 # ECK CRD group/version/plural mappings. These incidents are raised by the
 # event handler (`handlers/events.py`) and, until this scanner, were closed by
-# nothing: every other sweeper keys off a prefix none of these match. devops
-# carried a Kibana incident opened 2026-03-06 that was still active six months
-# later while the CR read green the whole time.
+# nothing: every other sweeper keys off a prefix none of these match. A Kibana
+# incident could stay active for months while the CR read green the whole time.
 _ECK_RESOURCES: dict[str, tuple[str, str, str]] = {
     "Elasticsearch": ("elasticsearch.k8s.elastic.co", "v1", "elasticsearches"),
     "Kibana": ("kibana.k8s.elastic.co", "v1", "kibanas"),
@@ -69,9 +68,8 @@ _ECK_RESOURCES: dict[str, tuple[str, str, str]] = {
 # `Challenge:ns/name:error` incidents. The certificate scanner auto-resolves
 # under `Certificate:ns/name` — no alias suffix — so its close never matched
 # the event-born key, and Challenge/Order objects are deleted by cert-manager
-# once the Order completes, so no event ever announced their recovery. Six
-# clusters carried the same three fossils for a week after `project-tls` had
-# renewed fine; only the 7-day stale reaper ever closed them.
+# once the Order completes, so no event ever announced their recovery. Incidents
+# stayed open for a week after the certificate had renewed fine; only the 7-day stale reaper ever closed them.
 # Orders and Challenges live in a separate API group — the RBAC has to grant
 # `acme.cert-manager.io`, not just `cert-manager.io`, or these reads are
 # Forbidden and the incidents stay exactly as they were.
@@ -377,9 +375,8 @@ class ReconcileScanner:
         """Auto-resolve Elasticsearch/Kibana/ApmServer incidents that read green.
 
         These are raised by the event handler on an ECK "Unhealthy" event. No
-        other sweeper matches their prefix, so nothing ever closed them: across
-        the whole fleet history every Elasticsearch and Kibana incident was
-        closed by hand, none automatically.
+        other sweeper matches their prefix, so nothing ever closed them - every
+        Elasticsearch and Kibana incident had to be closed by hand.
 
         Mirrors `_reconcile_flux`: a resource that is still degraded is kept
         alive rather than left to the stale reaper, and only green-or-gone

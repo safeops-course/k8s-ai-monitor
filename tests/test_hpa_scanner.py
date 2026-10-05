@@ -8,9 +8,8 @@ report it spuriously are not, and two of them were found in live objects before
 a line was written:
 
   - `ScalingLimited` is True at both ends of the range. An HPA resting on its
-    floor carries `ScalingLimited=True, reason=TooFewReplicas`, and after the
-    fleet was pre-warmed to a floor of 3 that is the normal state of nearly
-    everything in production.
+    floor carries `ScalingLimited=True, reason=TooFewReplicas`, and that is the
+    normal state of nearly every HPA in production.
   - Being briefly clamped is ordinary. A deploy alone moved one frontend
     3 -> 6 -> 3 in ten minutes while its CPU never left 0.2 cores.
 """
@@ -131,7 +130,7 @@ class TestSaturated(unittest.TestCase):
 class TestQuiet(unittest.TestCase):
 
     def test_autoscaler_resting_on_its_floor_is_not_reported(self):
-        """The trap. Post pre-warm this is the normal state of most of the fleet:
+        """The trap. Post pre-warm this is the normal state of most HPAs:
 
             alpha/backend  ScalingLimited True  TooFewReplicas
 
@@ -297,7 +296,7 @@ class TestAutoResolve(unittest.TestCase):
         self.assertEqual(results, [], "an incident was closed on an answer we never received")
 
     def test_a_readable_namespace_still_resolves_when_another_one_fails(self):
-        """The fix must not make one broken namespace freeze the whole fleet."""
+        """The fix must not make one broken namespace freeze the whole cluster."""
         api = MagicMock()
         api.list_namespaced_horizontal_pod_autoscaler.side_effect = [
             RuntimeError("forbidden"),

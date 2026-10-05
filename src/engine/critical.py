@@ -1,6 +1,6 @@
 """Shared helpers for deciding whether an alert targets a critical service.
 
-Two tiers (2026-04-18 split):
+Two tiers:
   - INFRA_CRITICAL_SERVICES: stateful deps (postgres, redis...).
     Outage affects everything — forced severity=critical + root-cause.
   - IMPORTANT_SERVICES: business services (backend, frontend, ...).

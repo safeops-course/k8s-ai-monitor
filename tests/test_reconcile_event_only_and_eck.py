@@ -1,13 +1,12 @@
 """Incidents that nothing was closing: ECK CRs and event-only workload aliases.
 
-Two separate holes, both found by auditing the fleet's active incidents on
-2026-09-17. Seven were open; six had a condition that was verifiably gone.
+Two separate holes, both found by auditing active incidents: most had a
+condition that was verifiably gone.
 
 ECK: every sweeper keys off a state_key prefix, and no prefix matched
-`Elasticsearch:` / `Kibana:` / `ApmServer:`. Across the entire history of the
-central store, not one incident on those kinds had ever been auto-resolved —
-devops carried a Kibana incident opened 2026-03-06 that was still active six
-months later while `kubectl get kibana` read green throughout.
+`Elasticsearch:` / `Kibana:` / `ApmServer:`. Not one incident on those kinds
+had ever been auto-resolved - a Kibana incident could stay active for months
+while `kubectl get kibana` read green throughout.
 
 Event-only workload aliases: `events.py` raises these (a probe failure lands as
 `unhealthy`) and schedules an in-memory deferred check to close them. The pod
@@ -281,7 +280,7 @@ def test_a_raised_deferred_delay_also_lifts_the_grace_window():
 # cert-manager (event-born Certificate / Challenge / Order / CertificateRequest)
 # --------------------------------------------------------------------------
 #
-# Found 2026-09-23: six clusters each carried the same three warnings for 4-5
+# Found in practice: the same three warnings stayed open for 4-5
 # days — `Certificate:platform/project-tls:error` plus two
 # `Challenge:…:error` — while `kubectl get certificate project-tls` read READY
 # and the Challenges no longer existed. The certificate scanner closes under

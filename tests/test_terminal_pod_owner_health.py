@@ -4,8 +4,7 @@ Kubernetes keeps Evicted/Failed pods in the API until the terminated-pod GC
 threshold is reached (12500 by default), so on a cluster that evicts rarely they
 never leave. Every scan rediscovers them and re-raises the same incident.
 
-juliet's `worker-history-86dfb94449-84cl4` was Evicted on 2026-07-31 and
-alerted 1495 times over the next 11 days while its Deployment sat at 1/1
+An Evicted pod (`worker-history-86dfb94449-84cl4`) alerted 1495 times over the next 11 days while its Deployment sat at 1/1
 Available. The eviction cause — a missing memory request — was fixed the day
 after. The pod kept repeating the original kubelet message, `request is 0`,
 long after it had stopped being true.
@@ -45,7 +44,7 @@ def _apps(ready, want, kind="Deployment"):
 
 
 def test_failed_pod_with_healthy_deployment_is_a_corpse():
-    """The juliet case: Evicted pod, Deployment 1/1 Available."""
+    """The real case: Evicted pod, Deployment 1/1 Available."""
     with patch("src.scanners.pod.k8s.AppsV1Api", return_value=_apps(ready=1, want=1)):
         assert _owner_is_healthy(_pod(), "platform") is True
 

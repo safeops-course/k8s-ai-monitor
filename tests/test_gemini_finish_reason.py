@@ -1,13 +1,13 @@
 """Tests for `_log_gemini_finish` — the loud failure on a truncated Gemini call.
 
-Background (juliet, 2026-08-10): Gemini charges THINKING tokens against
+Background: Gemini charges THINKING tokens against
 `max_output_tokens` and spends them before the answer. On a busy cluster the
 thinking pass consumed the 4096-token ceiling and left ~150 tokens for the
 report, so the JSON stopped mid-`reasoning` string. `resp.text` returns that
 partial text with no error, so by the time it reached the parser the failure
 was indistinguishable from a model that simply wrote bad JSON — and nothing in
-the logs named the real cause. 21 of 262 fleet reports (8%) failed this way
-over 14 days before anyone could point at the budget.
+the logs named the real cause. 8% of the reports failed this way over two
+weeks before anyone could point at the budget.
 """
 import logging
 

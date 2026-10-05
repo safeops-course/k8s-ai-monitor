@@ -1,4 +1,4 @@
-"""Tests for Sprint 8 root-cause correlation (not suppression).
+"""Tests for root-cause correlation (not suppression).
 
 Dependent alerts STILL fire — we want the cascade visible because it
 exposes services that aren't resilient to dep outages. What we add is

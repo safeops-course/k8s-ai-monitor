@@ -1,4 +1,4 @@
-"""Tests for Sprint 7 trace-correlation enrichment block."""
+"""Tests for trace-correlation enrichment block."""
 from unittest.mock import patch
 
 from src.engine import enrichment

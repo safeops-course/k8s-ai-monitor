@@ -414,7 +414,7 @@ class TestProviderApiKeyValidation(unittest.TestCase):
 class TestDebounceTiers(unittest.TestCase):
     """Three-tier debounce base: infra / important / default.
 
-    Renamed from TestExponentialBackoffCriticalService (2026-04-18 split).
+    Renamed from TestExponentialBackoffCriticalService.
     """
 
     def test_effective_debounce_base_for_infra_critical(self):
@@ -466,7 +466,7 @@ class TestNoiseReduction(unittest.TestCase):
         )
 
     def test_noise_reduction_skips_low_impact_warning(self):
-        """Routing contract rewrite 2026-04-18: non-critical warnings
+        """Routing contract: non-critical warnings
         with LLM verdict human_needed=False go to daily report, not Slack.
         """
         from src.engine.pipeline import _should_post_slack
@@ -500,7 +500,7 @@ class TestNoiseReduction(unittest.TestCase):
         self.assertTrue(should)
 
     def test_noise_reduction_warning_without_ar_goes_to_daily_report(self):
-        """Routing contract rewrite 2026-04-18: warnings without an LLM
+        """Routing contract: warnings without an LLM
         verdict (every non-critical_endpoint path) default to NOT posting
         to Slack. They still land in SQLite + daily report, and Sprint
         2.5 promotion upgrades chronic ones to critical. Previously

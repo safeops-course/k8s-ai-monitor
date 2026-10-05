@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS active_root_causes (
 CREATE INDEX IF NOT EXISTS idx_root_causes_ns_exp
     ON active_root_causes(namespace, expires_at);
 
--- Sprint 12: SLI breach state tracks ongoing SLO violations. A breach
+-- SLI breach state tracks ongoing SLO violations. A breach
 -- must last `duration_seconds` before emitting a ScanResult; we track
 -- (first_breach_at, last_seen_at, alerted) so subsequent scan ticks
 -- know whether the duration threshold has been met and whether we've
@@ -928,9 +928,8 @@ class SqliteStore:
         #
         # RETURNING keeps that single-statement property while still naming the
         # rows that were closed, so the caller can mirror them to the central
-        # board. Without it this path resolved locally and left the fleet board
-        # showing the incident as active forever (11 such fossils on the GKE
-        # clusters alone); resolved_by is stamped for the same reason the other
+        # board. Without it this path resolved locally and left the central board
+        # showing the incident as active forever; resolved_by is stamped for the same reason the other
         # sweeps stamp theirs — an unattributed resolve is indistinguishable
         # from a legacy row.
         stale_cutoff = time.time() - (7 * 86400)
@@ -1259,7 +1258,7 @@ class SqliteStore:
                 cur.rowcount,
             )
 
-    # --- SLI breach state (Sprint 12) ---
+    # --- SLI breach state ---
 
     def record_sli_breach(self, sli_name: str, labels_hash: str,
                           current_value: float | None) -> dict:

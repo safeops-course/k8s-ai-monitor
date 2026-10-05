@@ -1,4 +1,4 @@
-"""Tests for Sprint 9 PR1 — flux.py pipeline unification.
+"""Tests for flux.py pipeline unification.
 
 The handler previously called `notifier.post_alert` directly. Post-Sprint-9
 it emits a `ScanResult` and invokes `process_scan_results`. These tests

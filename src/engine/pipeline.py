@@ -113,7 +113,7 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
                        store=None) -> tuple[bool, str, str]:
     """Determine if an alert should be posted to Slack.
 
-    Routing contract (rewrite 2026-04-18):
+    Routing contract:
       - `critical` → Slack (immediately paging path)
       - `warning` → storage + daily report; Slack ONLY if LLM explicitly set
         `human_needed=True` (which today means a critical_endpoint RCA
@@ -126,7 +126,7 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
     pod / cert / backup / node / endpoint scanners. That also defeated
     `skip_llm=True` protections (rolling-update downgrade in endpoint.py
     never actually suppressed). Warnings now go to storage by default;
-    the daily report surfaces them once per day, and the Sprint 2.5
+    the daily report surfaces them once per day, and the
     persistent-promotion path (3+ occur, age >1h) still auto-upgrades
     chronic warnings into paging-critical so nothing rots forever.
 
@@ -201,7 +201,7 @@ def _max_cooldown(resource: str = "", pod_name: str = "",
 def _effective_debounce(namespace: str, resource: str = "", pod_name: str = "") -> int:
     """Base debounce seconds before exponential backoff is applied.
 
-    Three tiers (split 2026-04-18):
+    Three tiers:
       - INFRA_CRITICAL → CRITICAL_ALERT_COOLDOWN_SECONDS (300s default):
         stateful deps, first couple of alerts fire quickly
       - IMPORTANT → IMPORTANT_ALERT_COOLDOWN_SECONDS (600s default):
@@ -1025,13 +1025,9 @@ def _push_central_heartbeat(store: SqliteStore, r) -> None:
     """Keep the central row's clock honest while an incident is suppressed.
 
     A suppressed occurrence updates SQLite and nothing else, so ClickHouse kept
-    whatever was last pushed. Measured once: an incident the
-    scanner was still detecting on every cycle:
-
-        local   occurrence_count 7452, last_seen_at 2026-09-17 12:23
-        central occurrence_count 5191, last_seen_at 2026-09-15 07:56
-
-    Two days and 2261 occurrences apart. On the dashboard that live outage was
+    whatever was last pushed - for an incident the scanner was still
+    detecting on every cycle, the central copy fell days and thousands of
+    occurrences behind. On the dashboard that live outage was
     indistinguishable from a fossil — an incident whose condition is long gone
     but which nothing ever closed. Telling those two apart is the whole job of
     the dashboard, and a frozen timestamp makes it impossible.

@@ -127,7 +127,7 @@ EXCLUDE_NAMESPACES = {ns.strip() for ns in _raw_exclude.split(",") if ns.strip()
 _raw_nonprod = os.environ.get("NON_PROD_NAMESPACES", "")
 NON_PROD_NAMESPACES: set[str] = {ns.strip() for ns in _raw_nonprod.split(",") if ns.strip()}
 NON_PROD_DEBOUNCE_MULTIPLIER = parse_env_int("NON_PROD_DEBOUNCE_MULTIPLIER", 2, min_value=1)
-# NON_PROD_CRITICAL_ENDPOINT_LLM_ENABLED was removed 2026-04-20 after the
+# NON_PROD_CRITICAL_ENDPOINT_LLM_ENABLED was removed after the
 # deprecation period. If a stale deployment manifest still sets it, the
 # env var is silently ignored — Python doesn't crash on unknown env vars.
 NON_PROD_SCANNER_ENABLED = os.environ.get("NON_PROD_SCANNER_ENABLED", "false").lower() == "true"
@@ -179,7 +179,7 @@ LLM_DEBUG = os.environ.get("LLM_DEBUG", "false").lower() == "true"
 # DEADLINE_EXCEEDED spikes that dropped daily reports. Opt in per cluster.
 GEMINI_FLEX_ENABLED = os.environ.get("GEMINI_FLEX_ENABLED", "false").lower() == "true"
 
-# Critical services — split into two tiers (2026-04-18):
+# Critical services — split into two tiers:
 #
 #   INFRA_CRITICAL_SERVICES: stateful infrastructure. If one of these is
 #     down the whole business is affected. Forced to severity=critical,
@@ -284,7 +284,7 @@ CRITICAL_ALERT_MAX_COOLDOWN_SECONDS = parse_env_int(
 # A near-zero value keeps it close to the data we actually feed it.
 LLM_TEMPERATURE = parse_env_float("LLM_TEMPERATURE", 0.0, min_value=0.0, max_value=2.0)
 
-# Slack — two delivery paths (Sprint 10a, 2026-04-19):
+# Slack — two delivery paths:
 #
 #   1) Incoming Webhook (legacy): SLACK_WEBHOOK_URL — posts new top-level
 #      messages only; can't thread; doesn't return a ts. Kept as fallback
@@ -371,7 +371,7 @@ if EVENT_ONLY_RESOLVE_GRACE_SECONDS <= EVENT_AUTO_RESOLVE_DELAY_SECONDS:
 # central store. While an incident is inside its cooldown the pipeline records
 # the occurrence locally and stays silent everywhere else — which left the
 # central row frozen at whatever was last pushed, so a live incident read as a
-# days-old one on the fleet dashboard. This is a heartbeat, not an alert: it
+# days-old one on the central dashboard. This is a heartbeat, not an alert: it
 # carries no Slack post, no LLM call and no escalation, and exists only so
 # last_seen_at and occurrence_count in ClickHouse keep telling the truth.
 # 0 disables it.
@@ -390,8 +390,8 @@ POD_OOM_RECOVERY_STABLE_SECONDS = parse_env_int("POD_OOM_RECOVERY_STABLE_SECONDS
 # until proven otherwise: the handler waits out the remainder of this window and
 # alerts only if the pod is STILL not ready. Covers slow warmups the probe-config
 # budget cannot see (Prometheus WAL replay burned 3.7 cores and flapped probes
-# minutes after the ~40s probe budget expired — 2026-09-01, alert lottery across
-# 15 clusters after an STS recreate). 0 restores the probe-budget-only behavior.
+# minutes after the ~40s probe budget expired, alerting at random after a
+# StatefulSet recreate). 0 restores the probe-budget-only behavior.
 UNHEALTHY_STARTUP_SETTLE_SECONDS = parse_env_int("UNHEALTHY_STARTUP_SETTLE_SECONDS", 300, min_value=0)
 POD_LOG_LINES = parse_env_int("POD_LOG_LINES", 50, min_value=1)
 
@@ -401,9 +401,8 @@ POD_LOG_LINES = parse_env_int("POD_LOG_LINES", 50, min_value=1)
 MAX_LLM_CALLS_PER_HOUR = parse_env_int("MAX_LLM_CALLS_PER_HOUR", 60, min_value=1)
 
 # Retry on transient LLM errors (5xx / 429 / timeouts / connection
-# errors). Without this, a brief provider outage (e.g. Gemini 503 at
-# 06:00 UTC on 2026-04-24) causes the daily report to silently drop
-# for clusters that ran their report during the outage window.
+# errors). Without this, a brief provider outage (e.g. a provider 503)
+# causes the daily report to silently drop when it ran during the outage.
 # `LLM_RETRY_COUNT` is additional attempts beyond the first call, so
 # default 2 → 3 total attempts. `LLM_RETRY_BACKOFF_SECONDS` is base
 # for exponential backoff (5s, 10s, 20s by default). Set retry count
@@ -423,8 +422,8 @@ MAX_CONTEXT_BYTES_REPORT = parse_env_int("MAX_CONTEXT_BYTES_REPORT", 80000, min_
 # too, and thinking is spent FIRST. Measured by replaying
 # the real failing payload: thoughts=2164-2391, answer=536-603. At the old 4096
 # ceiling a busy cluster's thinking left ~150 tokens for the answer, so the JSON
-# was cut mid-`reasoning` string → parse fail → raw dump to Slack (21 of 262
-# fleet reports, 8%, over 14 days). GEMINI_THINKING_LEVEL below removes the
+# was cut mid-`reasoning` string → parse fail → raw dump to Slack (8% of the
+# reports over two weeks). GEMINI_THINKING_LEVEL below removes the
 # cause; this ceiling is the backstop.
 REPORT_MAX_OUTPUT_TOKENS = parse_env_int("REPORT_MAX_OUTPUT_TOKENS", 16384, min_value=1024)
 
@@ -508,7 +507,7 @@ ENDPOINT_INGRESS_SERVICE = os.environ.get("ENDPOINT_INGRESS_SERVICE", "")  # e.g
 ENDPOINT_BATCH_THRESHOLD = parse_env_int("ENDPOINT_BATCH_THRESHOLD", 3, min_value=1)  # min endpoints to trigger batch mode
 ENDPOINT_REDIS_SERVICE = os.environ.get("ENDPOINT_REDIS_SERVICE", "")  # fallback if auto-discovery fails; e.g. "redis-master.production.svc.cluster.local:6379"
 
-# SLI scanner (Sprint 12) — SLO-based symptom detection with dependency
+# SLI scanner — SLO-based symptom detection with dependency
 # chain correlation. Reads SLI definitions from a ConfigMap-mounted YAML
 # file, polls Prometheus on each scan tick, tracks breach state with
 # duration gating in `sli_breach_state` table, emits ScanResult through
@@ -534,9 +533,8 @@ BACKUP_MAX_AGE_HOURS = parse_env_int("BACKUP_MAX_AGE_HOURS", 26, min_value=1)  #
 SCANNER_POD_ENABLED = os.environ.get("SCANNER_POD_ENABLED", "true").lower() == "true"
 SCANNER_PVC_ENABLED = os.environ.get("SCANNER_PVC_ENABLED", "true").lower() == "true"
 SCANNER_CERT_ENABLED = os.environ.get("SCANNER_CERT_ENABLED", "true").lower() == "true"
-# On by default. Unlike the gates added in #77-#81, this scanner cannot silence
-# anything — it only raises a warning nobody was getting before, and the shape
-# of the fleet is exactly what we want to see everywhere at once. The three
+# On by default. Unlike the feature gates, this scanner cannot silence
+# anything - it only raises a warning nobody was getting before. The three
 # conditions it requires (see src/scanners/hpa.py) are what keep it quiet.
 SCANNER_HPA_ENABLED = os.environ.get("SCANNER_HPA_ENABLED", "true").lower() == "true"
 # ENDPOINT_SCAN_ENABLED is already defined above

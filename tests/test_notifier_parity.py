@@ -1,5 +1,5 @@
 """Tests for notifier bot/webhook parity on non-alert notices + permanent
-bot-error logging (2026-04-20).
+bot-error logging.
 
 Pre-fix, `post_daily_report`, `post_weekly_report`, `_post_daily_report_str`
 and `post_maintenance_notice` only used the webhook path — a cluster that

@@ -53,7 +53,7 @@ _GKE_MAINTENANCE_TAINTS = {
 # node is cordoned and goes NotReady while it is deleted — indistinguishable
 # from a maintenance drain on those two facts alone — so the cordoned+NotReady
 # heuristic below must exclude it, or routine autoscaling reads as maintenance
-# and silences alerting fleet-wide. The taint is the discriminator: the
+# and silences alerting cluster-wide. The taint is the discriminator: the
 # autoscaler sets it before draining, so it is present throughout the window.
 _AUTOSCALER_REMOVAL_TAINTS = {
     "ToBeDeletedByClusterAutoscaler",
@@ -333,7 +333,7 @@ async def _handle_incident_resolve(request):
     await loop.run_in_executor(
         None, lambda: store.set_resolved_by(incident_id, "operator")
     )
-    # Mirror the resolve to the central board — without this the fleet
+    # Mirror the resolve to the central board — without this the central
     # dashboard keeps the incident "open" forever (the fossil problem).
     inc = await loop.run_in_executor(None, store.get_incident_by_id, incident_id)
     if inc is not None:
@@ -620,7 +620,7 @@ async def _store_cleanup_loop(store):
         try:
             reaped = await loop.run_in_executor(None, store.cleanup)
             # Mirror the reaper's resolves to the central board. The local DB is
-            # the source of truth for the monitor's own decisions, but the fleet
+            # the source of truth for the monitor's own decisions, but the central
             # board reads ClickHouse — an unpushed resolve leaves the incident
             # "active" there forever. Pushed in the executor: it is a blocking
             # HTTP call with a 10s timeout.

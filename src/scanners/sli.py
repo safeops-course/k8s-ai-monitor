@@ -1,5 +1,5 @@
 """SLI scanner — user-visible SLO breach detection with dependency
-chain correlation (Sprint 12).
+chain correlation.
 
 Reads SLI definitions from a ConfigMap-mounted YAML file. On each scan
 tick (default 120s) queries Prometheus for the current value of every

@@ -1,6 +1,6 @@
 """Flux Kustomization/HelmRelease handlers — extracted from handlers.py.
 
-Sprint 9 — migrated to the shared pipeline. Stalled conditions emit a
+migrated to the shared pipeline. Stalled conditions emit a
 `ScanResult` that flows through `process_scan_results`, so flux alerts
 now get fingerprinting, escalation, enrichment, root-cause correlation
 and Slack threading — features the direct `post_alert` path bypassed.

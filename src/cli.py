@@ -272,7 +272,7 @@ def cmd_incident(args):
     if args.action == "resolve":
         store.set_status(inc.id, "resolved", clear_cooldown=True)
         store.set_resolved_by(inc.id, "operator")
-        # Same as the HTTP/Slack resolve: tell the fleet board, or it keeps the
+        # Same as the HTTP/Slack resolve: tell the central board, or it keeps the
         # incident open until the periodic central sync catches it.
         from src.engine import central_push
         central_push.push_incident_status(inc, "resolved", "operator")

@@ -1,4 +1,4 @@
-"""Tests for Sprint 9 events.py pipeline unification (PRs #51 + #52).
+"""Tests for events.py going through the shared pipeline.
 
 The pod-event batch flush, non-pod event fallback and NodeNotReady path
 previously called `notifier.post_alert` directly. Post-Sprint-9 they all
@@ -765,7 +765,7 @@ def _run_settle_case(tmp_path, *, pod_age, ready_after_wait, sleeps):
 
 def test_unhealthy_young_pod_recovered_within_settle_is_silent(tmp_path):
     """Pod 50s old (past the 40s probe budget) recovers during the settle
-    window — no batch entry, no alert. The 2026-09-01 WAL-replay case."""
+    window — no batch entry, no alert. The slow-warmup (WAL replay) case."""
     sleeps = []
     batched = _run_settle_case(tmp_path, pod_age=50, ready_after_wait=True, sleeps=sleeps)
     assert batched == []

@@ -1,13 +1,13 @@
-"""Incidents that stayed "active" although their cause was gone (2026-10-02).
+"""Incidents that stayed "active" although their cause was gone.
 
 Jobs: a FailedMount event on a CronJob run raises `Job:ns/name:mount`. `mount`
 is an event-only alias the pod scanner does not sweep, and the reconcile
-scanner only looked at Deployment/StatefulSet/DaemonSet/Pod — so juliet's
-minute-changed and storage-usage-checker runs and mike's initdb Job sat
-active for days after the Job finished and was deleted.
+scanner only looked at Deployment/StatefulSet/DaemonSet/Pod — so scheduled
+job runs and a database init Job sat active for days after the Job finished
+and was deleted.
 
 Central board: every resolve is pushed once, without waiting or retrying.
-juliet's ai-service OOM was resolved locally on 2026-09-29 14:34, but the
+An OOM incident was resolved locally, but the
 board only ever got the earlier `escalation` row and showed it open three days
 later. The CLI resolve path never pushed at all.
 """

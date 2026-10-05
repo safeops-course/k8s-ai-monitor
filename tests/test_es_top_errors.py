@@ -1,4 +1,4 @@
-"""Tests for Sprint 11 — ES top error pattern enrichment."""
+"""Tests for ES top error pattern enrichment."""
 from unittest.mock import patch
 
 from src.collectors import elasticsearch

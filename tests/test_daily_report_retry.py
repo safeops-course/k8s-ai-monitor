@@ -1,6 +1,6 @@
 """Tests for daily-report-level retry signalling.
 
-Regression (example, 2026-06-03 06:00): a multi-minute Gemini outage
+Regression: a multi-minute LLM provider outage
 (503 UNAVAILABLE / 504 DEADLINE_EXCEEDED) exhausted the per-call retry
 budget, an error placeholder was stored as "the report", and the next
 attempt was a full day later. `run_daily_report` now returns whether a

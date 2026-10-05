@@ -524,7 +524,7 @@ def _hpa_condition(status, cond_type: str):
 
 # ── ES top error patterns ────────────────────────────────────────────────
 #
-# Sprint 11: replace the "last 10 raw log lines" tail with "top 3 error
+# replace the "last 10 raw log lines" tail with "top 3 error
 # patterns over the last hour + their count". Most production
 # environments churn the same error thousands of times during an
 # outage; seeing "connection refused: postgres:5432 ×214" in the alert

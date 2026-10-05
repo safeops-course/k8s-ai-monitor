@@ -4,13 +4,8 @@ While an incident sits inside its cooldown the pipeline records the occurrence
 in SQLite and stays silent everywhere else — including towards ClickHouse. The
 central row therefore froze at whatever was last pushed.
 
-Measured on example 2026-09-17, one incident the scanner was still detecting on
-every single cycle:
-
-    local   occurrence_count 7452, last_seen_at 2026-09-17 12:23
-    central occurrence_count 5191, last_seen_at 2026-09-15 07:56
-
-Two days and 2261 occurrences apart. The consequence is worse than a stale
+For an incident the scanner was still detecting on every single cycle, the
+central copy fell days and thousands of occurrences behind. The consequence is worse than a stale
 number: on the dashboard a live outage looked exactly like a fossil — an
 incident whose condition is long gone but which nothing ever closed. Both show
 an old timestamp, and only one of them needs someone to wake up.

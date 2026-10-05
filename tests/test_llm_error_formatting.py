@@ -273,7 +273,7 @@ def test_retry_wrapper_disabled_when_count_zero(monkeypatch):
 
 
 def test_retry_wrapper_drops_flex_after_transient_failure(monkeypatch):
-    """Regression (example daily report, 2026-06-03): the flex/batch tier is
+    """Regression (a daily report): the flex/batch tier is
     deprioritised under load and yields 503/504 during demand spikes. After
     the first transient failure the wrapper must fall back to the standard
     tier (flex=False) for the remaining attempts."""

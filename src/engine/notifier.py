@@ -1,6 +1,6 @@
 """Slack posting — extracted from slack.py.
 
-Two delivery paths (Sprint 10a, 2026-04-19):
+Two delivery paths:
 
   * Bot API (primary when configured) — ``chat.postMessage`` returns
     ``ts``, enabling ``thread_ts`` replies for recurring / resolved

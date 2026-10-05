@@ -1,4 +1,4 @@
-"""Tests for Sprint 12 — SLI scanner + dependency chain correlation."""
+"""Tests for SLI scanner + dependency chain correlation."""
 import time
 from unittest.mock import patch
 

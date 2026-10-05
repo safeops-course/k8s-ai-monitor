@@ -76,7 +76,7 @@ async def _deferred_auto_resolve(alerted: list[tuple[str, str, str]]):
     path (`pipeline.py:_process_auto_resolve_results`): flips incident
     status to resolved, posts `post_resolved` for critical severity,
     clears root-cause marker, and pushes the resolved event to central
-    ClickHouse. Before Sprint 9 PR2 this function called
+    ClickHouse. Before the shared pipeline this function called
     `store.set_status` + `post_resolved` directly; post-migration it
     funnels through the same pipeline branch that scanner-emitted
     auto-resolves use.

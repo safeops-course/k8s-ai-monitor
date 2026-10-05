@@ -1,10 +1,10 @@
-"""The periodic stale reaper must NAME what it closed, so the fleet board
+"""The periodic stale reaper must NAME what it closed, so the central board
 can be told.
 
 Regression: SqliteStore.cleanup() closed >7d active incidents with a bulk
 UPDATE that returned nothing. The monitor considered them resolved while the
-central ClickHouse board kept showing them 'active' forever — 11 such fossils
-accumulated across the three GKE clusters, and every one of them had
+central ClickHouse board kept showing them 'active' forever - and every one
+of them had
 resolved_by = '' locally, which is the fingerprint of that path.
 """
 import time
