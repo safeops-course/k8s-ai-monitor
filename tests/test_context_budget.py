@@ -404,3 +404,32 @@ class TestMeasureReportData(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPassThroughSections(unittest.TestCase):
+    """Sections the payload builder does not know by name reach the LLM (found on kind:
+    an Alertmanager alert arrived as 71 bytes - only cluster and resource)."""
+
+    def test_alert_fields_reach_the_payload(self):
+        alert = {"source": "alertmanager", "alertname": "BackendErrorBudgetBurnFast",
+                 "summary": "production: backend users are failing", "labels": {"severity": "critical"}}
+        payload, truncated, _ = build_alert_payload(alert, "Alert/X", "safeops", 16000)
+        self.assertIn("backend users are failing", payload)
+        self.assertIn('"alertname": "BackendErrorBudgetBurnFast"', payload)
+        self.assertFalse(truncated)
+
+    def test_pass_through_sections_are_dropped_after_the_logs(self):
+        data = {"logs": ["error: x"] * 5, "description": "d" * 3000}
+        payload, truncated, notes = build_alert_payload(data, "Alert/X", "safeops", 1024)
+        self.assertTrue(truncated)
+        self.assertNotIn("ddd", payload)
+        self.assertIn("logs: dropped (budget)", notes)
+        self.assertEqual(notes[-1], "description: dropped (budget)")
+
+    def test_largest_pass_through_section_goes_first(self):
+        data = {"summary": "production: backend users are failing", "description": "d" * 3000}
+        payload, truncated, notes = build_alert_payload(data, "Alert/X", "safeops", 1024)
+        self.assertTrue(truncated)
+        self.assertIn("backend users are failing", payload)  # the summary stays
+        self.assertNotIn("ddd", payload)
+        self.assertEqual(notes, ["description: dropped (budget)"])

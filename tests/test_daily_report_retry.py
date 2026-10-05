@@ -29,6 +29,17 @@ def _patch_common(monkeypatch, result, saved, posted):
     monkeypatch.setattr(reporter, "_save_report", lambda *a, **k: saved.append(1))
     monkeypatch.setattr(reporter, "post_daily_report", lambda r: posted.append(1))
     monkeypatch.setattr(reporter.central_push, "push_report", lambda payload: None)
+    monkeypatch.setattr(reporter, "llm_configured", lambda: True)
+
+
+def test_no_llm_key_skips_the_report(monkeypatch):
+    saved, posted = [], []
+    _patch_common(monkeypatch, _result(llm_error=False), saved, posted)
+    monkeypatch.setattr(reporter, "llm_configured", lambda: False)
+    monkeypatch.setattr(reporter, "analyze_daily_report",
+                        lambda data: (_ for _ in ()).throw(AssertionError("LLM called")))
+    assert reporter.run_daily_report() is False  # nothing produced
+    assert saved == [] and posted == []
 
 
 def test_run_daily_report_returns_true_on_success(monkeypatch):
@@ -62,6 +73,7 @@ def test_run_daily_report_skips_when_already_running(monkeypatch):
     called = []
     monkeypatch.setattr(reporter, "Collector", _FakeCollector)
     monkeypatch.setattr(reporter, "analyze_daily_report", lambda data: called.append(1))
+    monkeypatch.setattr(reporter, "llm_configured", lambda: True)
     reporter._daily_report_lock.acquire()
     try:
         assert reporter.run_daily_report() is False
@@ -89,3 +101,14 @@ def test_run_daily_report_suppress_flag_ignored_on_success(monkeypatch):
                   saved, posted)
     assert reporter.run_daily_report(suppress_error_output=True) is True
     assert saved and posted
+
+
+def test_scheduler_does_not_run_or_retry_without_a_key(monkeypatch):
+    """No key: the retry wrapper returns False at once - no attempt, no checkpoint."""
+    import asyncio
+
+    from src.handlers import startup
+    monkeypatch.setattr(startup, "llm_configured", lambda: False)
+    monkeypatch.setattr(startup, "run_daily_report",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("report ran")))
+    assert asyncio.run(startup._run_daily_with_retries()) is False

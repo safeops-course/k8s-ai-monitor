@@ -15,5 +15,8 @@ RUN useradd --create-home --no-log-init --uid 1000 monitor \
 USER monitor
 
 ENV PYTHONPATH=/app
+# Unbuffered stdout: without a Slack webhook an incident is printed to the log
+# (notifier._console_alert); buffered, it never shows in kubectl logs.
+ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["kopf", "run", "--standalone", "--all-namespaces", "src/handlers/__init__.py"]

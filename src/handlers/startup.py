@@ -24,7 +24,7 @@ from src.collectors import Collector
 from src.collectors.node import get_node_metrics_summary
 from src.collectors.app_metrics import get_app_metrics_summary
 from src.reporter import run_daily_report, run_weekly_report
-from src.engine.llm import _get_client, _get_model
+from src.engine.llm import _get_client, _get_model, _openai_token_param, llm_configured
 
 logger = logging.getLogger(__name__)
 
@@ -834,8 +834,12 @@ async def _run_daily_with_retries() -> bool:
     (the one made when retrying again would exceed the window) surfaces a
     sustained outage.
 
-    Returns True if a real report was produced.
+    Returns True if a real report was produced. Without an LLM key there is nothing
+    to produce and nothing to retry: False at once, so no checkpoint is written.
     """
+    if not llm_configured():
+        logger.warning("Daily report skipped: no API key for LLM_PROVIDER=%s", config.LLM_PROVIDER)
+        return False
     interval_sec = config.DAILY_REPORT_RETRY_INTERVAL_MINUTES * 60
     window_sec = config.DAILY_REPORT_RETRY_MAX_HOURS * 3600
     loop = asyncio.get_running_loop()
@@ -1100,6 +1104,55 @@ def _startup_cleanup(store):
         logger.info("Startup cleanup: resolved %d stale/non-prod incidents", resolved)
 
 
+def _check_llm() -> None:
+    """One tiny LLM call at startup, so a bad key or model shows in the log at once.
+    Without a key there is nothing to test: say what the monitor does without one."""
+    if not llm_configured():
+        logger.warning("LLM not configured (no API key for LLM_PROVIDER=%s): incidents are tracked "
+                       "and posted with their context, without analysis; no daily/weekly report",
+                       config.LLM_PROVIDER)
+        return
+    try:
+        provider, client = _get_client()
+        alert_model = _get_model(provider, "alert")
+        report_model = _get_model(provider, "report")
+        logger.info("LLM provider=%s, alert_model=%s, report_model=%s — testing...",
+                     provider, alert_model, report_model)
+        if provider == "openai":
+            token_param = _openai_token_param(alert_model)
+            resp = client.chat.completions.create(
+                model=alert_model,
+                messages=[{"role": "user", "content": "Reply with just: ok"}],
+                **{token_param: 3},
+            )
+            logger.info("LLM check OK: %s responded (%d tokens)", alert_model,
+                         resp.usage.prompt_tokens + resp.usage.completion_tokens if resp.usage else 0)
+        elif provider == "gemini":
+            from google.genai import types as _genai_types
+            resp = client.models.generate_content(
+                model=alert_model,
+                contents="Reply with just: ok",
+                config=_genai_types.GenerateContentConfig(
+                    system_instruction="Reply with just the word ok",
+                    max_output_tokens=8,
+                ),
+            )
+            usage = getattr(resp, "usage_metadata", None)
+            total = ((getattr(usage, "prompt_token_count", 0) or 0)
+                     + (getattr(usage, "candidates_token_count", 0) or 0))
+            logger.info("LLM check OK: %s responded (%d tokens)", alert_model, total)
+        else:
+            resp = client.messages.create(
+                model=alert_model,
+                messages=[{"role": "user", "content": "Reply with just: ok"}],
+                max_tokens=3,
+            )
+            logger.info("LLM check OK: %s responded (%d tokens)", alert_model,
+                         (resp.usage.input_tokens + resp.usage.output_tokens) if resp.usage else 0)
+    except Exception as e:
+        logger.error("LLM check FAILED for provider=%s: %s", config.LLM_PROVIDER, e)
+
+
 @kopf.on.startup()
 async def on_startup(settings: kopf.OperatorSettings, **kwargs):
     settings.watching.server_timeout = 600
@@ -1139,47 +1192,6 @@ async def on_startup(settings: kopf.OperatorSettings, **kwargs):
             logger.warning("Prometheus at %s is NOT reachable: %s", config.PROMETHEUS_URL, e)
     else:
         logger.warning("PROMETHEUS_URL not set — node metrics will use Metrics API only")
-    # LLM connectivity check
-    try:
-        provider, client = _get_client()
-        alert_model = _get_model(provider, "alert")
-        report_model = _get_model(provider, "report")
-        logger.info("LLM provider=%s, alert_model=%s, report_model=%s — testing...",
-                     provider, alert_model, report_model)
-        if provider == "openai":
-            token_param = ("max_completion_tokens" if alert_model.startswith("gpt-5")
-                           else "max_tokens")
-            resp = client.chat.completions.create(
-                model=alert_model,
-                messages=[{"role": "user", "content": "Reply with just: ok"}],
-                **{token_param: 3},
-            )
-            logger.info("LLM check OK: %s responded (%d tokens)", alert_model,
-                         resp.usage.prompt_tokens + resp.usage.completion_tokens if resp.usage else 0)
-        elif provider == "gemini":
-            from google.genai import types as _genai_types
-            resp = client.models.generate_content(
-                model=alert_model,
-                contents="Reply with just: ok",
-                config=_genai_types.GenerateContentConfig(
-                    system_instruction="Reply with just the word ok",
-                    max_output_tokens=8,
-                ),
-            )
-            usage = getattr(resp, "usage_metadata", None)
-            total = ((getattr(usage, "prompt_token_count", 0) or 0)
-                     + (getattr(usage, "candidates_token_count", 0) or 0))
-            logger.info("LLM check OK: %s responded (%d tokens)", alert_model, total)
-        else:
-            resp = client.messages.create(
-                model=alert_model,
-                messages=[{"role": "user", "content": "Reply with just: ok"}],
-                max_tokens=3,
-            )
-            logger.info("LLM check OK: %s responded (%d tokens)", alert_model,
-                         (resp.usage.input_tokens + resp.usage.output_tokens) if resp.usage else 0)
-    except Exception as e:
-        logger.error("LLM check FAILED for provider=%s: %s", config.LLM_PROVIDER, e)
 
     logger.info("HTTP auth: %s", "enabled (INTERNAL_TOKEN set)" if config.INTERNAL_TOKEN else "disabled")
     logger.info("State backend: sqlite (%s)", config.SQLITE_PATH)
@@ -1193,6 +1205,10 @@ async def on_startup(settings: kopf.OperatorSettings, **kwargs):
     # before store init is attempted — otherwise a synchronous get_store()
     # failure could pre-empt the bind and /healthz would be unreachable.
     await _start_http_server()
+
+    # The LLM probe is a network call of up to a minute: in a worker thread, not awaited,
+    # so neither startup nor /healthz waits for it. It only logs.
+    asyncio.get_running_loop().run_in_executor(None, _check_llm)
 
     store = get_store()
 

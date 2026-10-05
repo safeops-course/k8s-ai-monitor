@@ -84,6 +84,12 @@ def measure_context(context: str) -> dict:
 
 # --- Dict-based budget (for alerts) ---
 
+# Sections build_alert_payload handles by name; every other key is passed through.
+_KNOWN_ALERT_SECTIONS = frozenset({
+    "pod", "owner", "node_metrics", "diagnostics", "logs", "events",
+    "flux_resource", "conditions", "event", "error", "raw",
+})
+
 def build_alert_payload(data: dict, resource: str, cluster: str,
                         max_bytes: int) -> tuple[str, bool, list[str]]:
     """Build JSON payload for alert LLM call with section limits.
@@ -155,6 +161,12 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
     if "raw" in data:
         payload["context"] = data["raw"]
 
+    # Any other section goes through as is (an Alertmanager alert's summary, description
+    # and labels; an SLI breach) - a section the LLM never sees cannot inform it.
+    extras = [k for k in data if k not in _KNOWN_ALERT_SECTIONS and k not in payload]
+    for key in extras:
+        payload[key] = data[key]
+
     json_str = json.dumps(payload, ensure_ascii=False)
 
     # Progressive trim — logs only. Structured sections (pod, owner, events,
@@ -190,6 +202,14 @@ def build_alert_payload(data: dict, resource: str, cluster: str,
             elif step == "drop_logs":
                 del payload["logs"]
                 notes.append("logs: dropped (budget)")
+            json_str = json.dumps(payload, ensure_ascii=False)
+        # Still over: the pass-through sections go last, after the logs - the largest
+        # first, so a long description goes before a one-line summary.
+        for key in sorted(extras, key=lambda k: -len(json.dumps(payload[k], ensure_ascii=False))):
+            if len(json_str.encode("utf-8")) <= max_bytes:
+                break
+            del payload[key]
+            notes.append(f"{key}: dropped (budget)")
             json_str = json.dumps(payload, ensure_ascii=False)
 
     final_bytes = len(json_str.encode("utf-8"))

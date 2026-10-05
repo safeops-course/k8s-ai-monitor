@@ -1,4 +1,6 @@
 """Tests for the CRITICAL_SERVICES -> INFRA/IMPORTANT split, with the default tiers."""
+from unittest import mock
+
 from src import config
 from src.engine import critical
 
@@ -100,7 +102,9 @@ def test_pipeline_forces_critical_only_on_infra():
         severity="warning", resource="Pod/frontend-abc",
         namespace="prod", issue_type="crash", pod_name="frontend-abc",
     )
-    should, _, sev = _should_post_slack(None, important_r, is_collective=False)
+    # (with an LLM key: without one, nothing can give a verdict and the warning posts)
+    with mock.patch("src.engine.pipeline.llm_configured", return_value=True):
+        should, _, sev = _should_post_slack(None, important_r, is_collective=False)
     assert sev == "warning"
     assert should is False  # warning without LLM verdict → no Slack
 

@@ -17,7 +17,7 @@ from src.engine.critical import (
 from src.engine.enrichment import build_enrichment_blocks
 from src.engine.escalation import EscalationResult, check_escalation
 from src.engine.fingerprint import compute_fingerprint
-from src.engine.llm import analyze_alert, AnalysisResult
+from src.engine.llm import analyze_alert, AnalysisResult, llm_configured
 from src.engine.notifier import (
     post_alert, post_resolved,
     format_structured_analysis, format_context_summary, get_webhook_for_namespace,
@@ -160,6 +160,11 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
         return True, "collective incident", severity
     if severity == "critical":
         return True, "critical severity", severity
+
+    # No LLM key: nothing can say human_needed, and there is no daily report to
+    # carry the warning either - post it, unanalysed, or nobody ever sees it.
+    if ar is None and not r.skip_llm and not llm_configured():
+        return True, "no LLM key → posted unanalysed", severity
 
     # Warning / info path: only post if LLM explicitly said human_needed.
     # This is currently only reachable via critical_endpoint (the one
@@ -595,12 +600,12 @@ def process_scan_results(results: list, store: SqliteStore,
                 continue
 
             # Single unified alert path: collect context, analyze (unless
-            # r.skip_llm - non-prod, maintenance), render, post.
+            # r.skip_llm - non-prod, maintenance - or no LLM key), render, post.
             context = _collect_context(r, collect_context_fn)
             raw_context = json.dumps(context) if isinstance(context, dict) else context
             ctx_hash = store.store_context(raw_context)
 
-            if r.skip_llm:
+            if r.skip_llm or not llm_configured():
                 ar = None
                 analysis_text = (
                     format_context_summary(context) if isinstance(context, dict)
@@ -789,12 +794,12 @@ def process_scan_results(results: list, store: SqliteStore,
             )
 
             # Single unified alert path for new incidents: the LLM analyzes
-            # unless r.skip_llm (non-prod, maintenance).
+            # unless r.skip_llm (non-prod, maintenance) or there is no LLM key.
             context = _collect_context(r, collect_context_fn)
             raw_context = json.dumps(context) if isinstance(context, dict) else context
             ctx_hash = store.store_context(raw_context)
 
-            if r.skip_llm:
+            if r.skip_llm or not llm_configured():
                 ar = None
                 analysis_text = (
                     format_context_summary(context) if isinstance(context, dict)
