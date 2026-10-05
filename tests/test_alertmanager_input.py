@@ -66,6 +66,19 @@ class TestAlertToResult(unittest.TestCase):
         with self.assertRaises(ValueError):
             alertmanager.alert_to_result({"labels": ["alertname"], "status": "firing"})
 
+    def test_empty_array_labels_are_refused_but_null_is_empty(self):
+        with self.assertRaises(ValueError):
+            alertmanager.alert_to_result({"labels": [], "fingerprint": "f1"})
+        # null labels = no alertname: not ours to track, not an error
+        self.assertIsNone(alertmanager.alert_to_result({"labels": None, "annotations": None}))
+
+    def test_alert_without_fingerprint_is_refused(self):
+        for fp in (None, "", 42):
+            alert = _alert()
+            alert["fingerprint"] = fp
+            with self.assertRaises(ValueError, msg=repr(fp)):
+                alertmanager.alert_to_result(alert)
+
     def test_secret_in_summary_is_redacted_from_the_title(self):
         alert = _alert()
         alert["annotations"]["summary"] = "login failed, password=" + "hunter" + "2-demo"

@@ -42,9 +42,12 @@ def _watched(namespace: str) -> bool:
 
 def alert_to_result(alert: dict) -> ScanResult | None:
     """One Alertmanager alert -> one ScanResult, or None when it is not ours to track.
-    Raises ValueError for a malformed alert (labels or annotations that are not objects)."""
-    labels = alert.get("labels") or {}
-    annotations = alert.get("annotations") or {}
+    Raises ValueError for a malformed alert: labels or annotations that are not objects
+    (absent or null is empty), or no fingerprint on an alert we track."""
+    labels = alert.get("labels")
+    labels = {} if labels is None else labels
+    annotations = alert.get("annotations")
+    annotations = {} if annotations is None else annotations
     if not isinstance(labels, dict) or not isinstance(annotations, dict):
         raise ValueError("alert labels and annotations must be objects")
     alertname = labels.get("alertname", "")
@@ -54,7 +57,11 @@ def alert_to_result(alert: dict) -> ScanResult | None:
     if not _watched(namespace):
         return None
 
-    fingerprint = alert.get("fingerprint", "")
+    # The fingerprint identifies the alert (its label set): a shared fallback would let one
+    # alert's `resolved` close another's incident. Alertmanager always sends it.
+    fingerprint = alert.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError(f"alert {alertname} has no fingerprint")
     severity = labels.get("severity", "warning")
     if severity not in ("critical", "warning"):
         severity = "warning"
@@ -75,7 +82,7 @@ def alert_to_result(alert: dict) -> ScanResult | None:
         "generator_url": alert.get("generatorURL", ""),
     }
     return ScanResult(
-        state_key=f"Alert:{scope}/{alertname}:{fingerprint or 'none'}",
+        state_key=f"Alert:{scope}/{alertname}:{fingerprint}",
         # The title goes to Slack as is (the pipeline sanitizes the context, not the title)
         title=sanitize_value(annotations.get("summary") or f"Alert {alertname}"),
         severity=severity,
