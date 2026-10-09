@@ -96,19 +96,58 @@ jobs:
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
-      - name: Generate and attach SBOM attestation
+      # One SBOM per published platform, all attested to the index digest - the digest a tag resolves
+      # to and admission verifies. syft scans one platform of a multi-platform image (linux/amd64 when
+      # none is named), so a single SBOM described amd64 only, while kind on Apple silicon runs arm64.
+      # Each SBOM names its platform in the image's package URL (pkg:oci/...?arch=arm64).
+      - name: Generate and attach one SBOM attestation per platform
         env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
           # syft pinned and checksum-verified (this job holds packages:write and id-token:write).
           archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
           curl -sSfL -o "${archive}" "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${archive}"
           echo "${SYFT_SHA256}  ${archive}" | sha256sum --check --strict
           tar -xzf "${archive}" -C /usr/local/bin syft
           rm "${archive}"
-          syft "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}" -o spdx-json=sbom.spdx.json
-          cosign attest --yes --predicate sbom.spdx.json --type spdxjson \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+          image="${IMAGE}@${DIGEST}"
+          # The platforms the index holds - not attestation manifests (unknown/unknown).
+          platforms="$(docker buildx imagetools inspect --raw "${image}" \
+            | jq -r '.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"' | sort -u)"
+          [[ -n "${platforms}" ]] || { echo "::error::no platforms in the index ${image}"; exit 1; }
+          for platform in ${platforms}; do  # one per line, no spaces: word splitting is the point
+            arch="${platform#*/}"
+            syft "${image}" --platform "${platform}" -o "spdx-json=sbom-${arch}.spdx.json"
+            cosign attest --yes --predicate "sbom-${arch}.spdx.json" --type spdxjson "${image}"
+          done
+          echo "${platforms}" > platforms.txt
+
+      # Fail loudly when a published platform has no SBOM that admission can read: the attestations are
+      # verified the way the cluster does (this workflow's identity), and each one's architecture is
+      # read from the image's package URL. Each attestation's payload is decoded on its own (jq
+      # @base64d), not all of them through one base64 -d.
+      - name: Every published platform has an SBOM
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/build.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE}@${DIGEST}"
+          attested="$(cosign verify-attestation --type spdxjson "${image}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "${IDENTITY}" \
+            | jq -r '.payload | @base64d | fromjson
+                | .predicate.packages[].externalRefs[]?.referenceLocator | select(startswith("pkg:oci/"))
+                | capture("arch=(?<a>[^&]+)").a' | sort -u)"
+          expected="$(sed 's|.*/||' platforms.txt | sort -u)"
+          echo "published: $(tr '\n' ' ' <<<"${expected}")  attested: $(tr '\n' ' ' <<<"${attested}")"
+          if [[ "${attested}" != "${expected}" ]]; then
+            echo "::error::SBOM attestations (${attested//$'\n'/ }) do not cover the published platforms (${expected//$'\n'/ })"
+            exit 1
+          fi
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
