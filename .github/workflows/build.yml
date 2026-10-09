@@ -126,7 +126,8 @@ jobs:
 
       # Fail loudly when a published platform has no SBOM that admission can read: the attestations are
       # verified the way the cluster does (this workflow's identity), and each one's architecture is
-      # read from the image's package URL.
+      # read from the image's package URL. Each attestation's payload is decoded on its own (jq
+      # @base64d), not all of them through one base64 -d.
       - name: Every published platform has an SBOM
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -138,8 +139,8 @@ jobs:
           attested="$(cosign verify-attestation --type spdxjson "${image}" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               --certificate-identity "${IDENTITY}" \
-            | jq -r '.payload' | base64 -d \
-            | jq -r '.predicate.packages[].externalRefs[]?.referenceLocator | select(startswith("pkg:oci/"))
+            | jq -r '.payload | @base64d | fromjson
+                | .predicate.packages[].externalRefs[]?.referenceLocator | select(startswith("pkg:oci/"))
                 | capture("arch=(?<a>[^&]+)").a' | sort -u)"
           expected="$(sed 's|.*/||' platforms.txt | sort -u)"
           echo "published: $(tr '\n' ' ' <<<"${expected}")  attested: $(tr '\n' ' ' <<<"${attested}")"
