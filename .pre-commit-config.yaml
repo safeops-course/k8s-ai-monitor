@@ -20,7 +20,7 @@ repos:
   # Pinned: a ruff release that adds a rule would otherwise fail commits on
   # untouched code, with no change to blame.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.20
+    rev: v0.17.0
     hooks:
       - id: ruff-check
 

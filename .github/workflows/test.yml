@@ -12,18 +12,18 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"   # = the Dockerfile's base image
           cache: pip
 
       - name: Install
         # Pinned like the pre-commit hook: a new release must not fail CI on unchanged code.
-        run: pip install -r requirements.txt pytest==9.1.1 ruff==0.15.20
+        run: pip install -r requirements.txt pytest==9.1.1 ruff==0.17.0
 
       - name: Ruff
         run: ruff check .
