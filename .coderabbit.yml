@@ -75,7 +75,7 @@ reviews:
         - Cover edge cases (empty, malformed LLM JSON, unicode); no time- or order-dependent assertions.
     - path: "Dockerfile"
       instructions: |
-        - python:3.12-slim, requirements.txt copied before src/, non-root uid 1000, PYTHONPATH=/app, ENTRYPOINT kopf run src/handlers/__init__.py. Keep these; no secrets or build-time credentials.
+        - python:3.14-slim, requirements.txt copied before src/, non-root uid 1000, PYTHONPATH=/app, ENTRYPOINT kopf run src/handlers/__init__.py. Keep these; no secrets or build-time credentials.
     - path: "{requirements.txt,pyproject.toml}"
       instructions: |
         - requirements.txt uses lower bounds only (>=); flag new dependencies without a clear need and major-version jumps of anthropic/openai/kopf/kubernetes.
