@@ -185,3 +185,46 @@ def test_a_critical_result_is_untouched_by_the_flag(tmp_path):
     r.severity = "critical"
     _run([r], store)
     assert _severity(store, "HPA:production/frontend-x:saturated") == "critical"
+
+
+# --- the model's severity -----------------------------------------------------
+# A Prometheus alert arrives with never_promote (handlers/alertmanager.py): its
+# rule already decided the severity, and in production the LLM analyses it. The
+# analysis carries a severity of its own; the gate must not adopt it.
+
+def _analysis(severity):
+    from src.engine.llm import AnalysisResult
+    return AnalysisResult(raw_text="", parsed={"severity": severity}, parse_error=False,
+                          model="test", tokens_in=None, tokens_out=None, cost_usd=None)
+
+
+def _alert(never_promote: bool, severity="warning"):
+    return ScanResult(
+        state_key="Alert:production/BackendErrorBudgetBurn",
+        title="BackendErrorBudgetBurn",
+        severity=severity,
+        resource="Deployment/backend",
+        namespace="production",
+        issue_type="alert",
+        never_promote=never_promote,
+    )
+
+
+def test_the_model_cannot_raise_a_final_severity():
+    _post, _reason, severity = pipeline._should_post_slack(
+        _analysis("critical"), _alert(never_promote=True), False)
+    assert severity == "warning"
+
+
+def test_the_model_cannot_lower_a_final_severity():
+    _post, _reason, severity = pipeline._should_post_slack(
+        _analysis("warning"), _alert(never_promote=True, severity="critical"), False)
+    assert severity == "critical"
+
+
+def test_without_the_flag_the_model_still_decides():
+    """The control: without it the two tests above could pass on a gate that
+    never read the analysis at all."""
+    _post, _reason, severity = pipeline._should_post_slack(
+        _analysis("critical"), _alert(never_promote=False), False)
+    assert severity == "critical"

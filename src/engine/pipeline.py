@@ -136,6 +136,15 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
     """
     severity = ar.parsed.get("severity", r.severity) if ar and ar.parsed else r.severity
 
+    # A result that declared its severity final (never_promote: a Prometheus
+    # alert, whose rule already decided; the HPA and SLI scanners) keeps it.
+    # The model's own severity is only logged - it neither raises nor lowers
+    # the alert, and the forced-critical classes below do not apply either.
+    if getattr(r, "never_promote", False):
+        if severity != r.severity:
+            logger.info("Model rated %s as %s; keeping the alert's own severity %s",
+                        r.state_key, severity, r.severity)
+        severity = r.severity
     # Forced-critical classes. Match on stable identifiers only: resource
     # + pod_name — state_key would mix namespace/reason tokens into the
     # subset match, e.g. ns="api-backend" + workload="gateway-worker"
