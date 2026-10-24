@@ -261,11 +261,12 @@ _MODEL_PRICING = {
 # >= 0.7 means False, else True). Putting a default of True here would
 # shadow that branch and force every high-confidence response that omits
 # the field into `human_needed=True`, which destroys the noise-reduction
-# gate in `pipeline._should_post_slack`.
+# gate in `pipeline._should_post_slack`. Nor is `severity`: a default would
+# look like the model's verdict there and lower a critical result to warning
+# whenever the model left it out.
 _ANALYSIS_DEFAULTS = {
     "reasoning": "",
     "confidence": 0.3,
-    "severity": "warning",
     "impact": "unknown",
     "hypotheses": [],
     "suggested_actions": [],
@@ -389,7 +390,6 @@ def parse_analysis(raw: str) -> tuple[dict, bool]:
             "reasoning": "",
             "root_cause": raw,
             "confidence": 0.3,
-            "severity": "warning",
             "impact": "unknown",
             "hypotheses": [],
             "suggested_actions": [],

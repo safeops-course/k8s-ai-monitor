@@ -134,27 +134,36 @@ def _should_post_slack(ar: AnalysisResult | None, r, is_collective: bool,
     already assigns severity by threshold (80%→warning, 90%→critical).
     The blanket promotion made every 82%-full volume page the on-call.
     """
-    severity = ar.parsed.get("severity", r.severity) if ar and ar.parsed else r.severity
+    # The model's severity counts only when it gave one: a reply that failed to
+    # parse, or one without a valid severity, keeps the scanner's.
+    model_severity = None
+    if ar and ar.parsed and not ar.parse_error:
+        if ar.parsed.get("severity") in ("critical", "warning"):
+            model_severity = ar.parsed["severity"]
 
-    # A result that declared its severity final (never_promote: a Prometheus
-    # alert, whose rule already decided; the HPA and SLI scanners) keeps it.
-    # The model's own severity is only logged - it neither raises nor lowers
-    # the alert, and the forced-critical classes below do not apply either.
-    if getattr(r, "never_promote", False):
-        if severity != r.severity:
-            logger.info("Model rated %s as %s; keeping the alert's own severity %s",
-                        r.state_key, severity, r.severity)
+    if r.never_promote:
+        # A result that declared its severity final (a Prometheus alert, whose
+        # rule already decided; the HPA and SLI scanners) keeps it: the model's
+        # rating and the forced-critical classes below neither raise nor lower
+        # it. Whether a warning still reaches Slack (human_needed) is routing,
+        # not severity, and stays below.
         severity = r.severity
-    # Forced-critical classes. Match on stable identifiers only: resource
-    # + pod_name — state_key would mix namespace/reason tokens into the
-    # subset match, e.g. ns="api-backend" + workload="gateway-worker"
-    # would spuriously match svc "api-gateway". Only INFRA-tier services
-    # force critical; business services (frontend, backend, ...)
-    # use their scanner-assigned severity.
-    if r.issue_type == "critical_endpoint":
-        severity = "critical"
-    elif _matches_infra_critical(r.resource, r.pod_name):
-        severity = "critical"
+        if model_severity and model_severity != severity:
+            logger.debug("Model rated %s as %s; keeping its own severity %s",
+                         r.state_key, model_severity, severity)
+    else:
+        severity = model_severity or r.severity
+
+        # Forced-critical classes. Match on stable identifiers only: resource
+        # + pod_name — state_key would mix namespace/reason tokens into the
+        # subset match, e.g. ns="api-backend" + workload="gateway-worker"
+        # would spuriously match svc "api-gateway". Only INFRA-tier services
+        # force critical; business services (frontend, backend, ...)
+        # use their scanner-assigned severity.
+        if r.issue_type == "critical_endpoint":
+            severity = "critical"
+        elif _matches_infra_critical(r.resource, r.pod_name):
+            severity = "critical"
 
     # Non-prod: always post to the non-prod webhook. The non-prod Slack
     # channel is by design a lower-priority lane that absorbs develop/

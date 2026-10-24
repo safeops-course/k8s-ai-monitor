@@ -190,41 +190,82 @@ def test_a_critical_result_is_untouched_by_the_flag(tmp_path):
 # --- the model's severity -----------------------------------------------------
 # A Prometheus alert arrives with never_promote (handlers/alertmanager.py): its
 # rule already decided the severity, and in production the LLM analyses it. The
-# analysis carries a severity of its own; the gate must not adopt it.
+# analysis may carry a severity of its own; the gate must not adopt it, and the
+# forced-critical classes must not apply either.
 
-def _analysis(severity):
+def _analysis(parsed, parse_error=False):
     from src.engine.llm import AnalysisResult
-    return AnalysisResult(raw_text="", parsed={"severity": severity}, parse_error=False,
+    return AnalysisResult(raw_text="", parsed=parsed, parse_error=parse_error,
                           model="test", tokens_in=None, tokens_out=None, cost_usd=None)
 
 
-def _alert(never_promote: bool, severity="warning"):
-    return ScanResult(
-        state_key="Alert:production/BackendErrorBudgetBurn",
-        title="BackendErrorBudgetBurn",
-        severity=severity,
-        resource="Deployment/backend",
-        namespace="production",
-        issue_type="alert",
-        never_promote=never_promote,
-    )
+def _alert(severity="warning", pod="postgres-0"):
+    """A real Alertmanager result - the same conversion the webhook runs."""
+    from src.handlers.alertmanager import alert_to_result
+    r = alert_to_result({
+        "status": "firing",
+        "fingerprint": "a1b2c3",
+        "labels": {"alertname": "KubePodNotReady", "namespace": "production",
+                   "severity": severity, "pod": pod},
+        "annotations": {"summary": "pod not ready"},
+    })
+    assert r is not None and r.never_promote
+    return r
 
 
 def test_the_model_cannot_raise_a_final_severity():
     _post, _reason, severity = pipeline._should_post_slack(
-        _analysis("critical"), _alert(never_promote=True), False)
+        _analysis({"severity": "critical"}), _alert(pod="web-0"), False)
     assert severity == "warning"
 
 
 def test_the_model_cannot_lower_a_final_severity():
     _post, _reason, severity = pipeline._should_post_slack(
-        _analysis("warning"), _alert(never_promote=True, severity="critical"), False)
+        _analysis({"severity": "warning"}), _alert(severity="critical", pod="web-0"), False)
     assert severity == "critical"
 
 
+def test_an_infra_pod_does_not_raise_a_final_severity():
+    """postgres is an infra-critical service: a scanner result for its pod is
+    forced to critical, a Prometheus warning about it is not."""
+    _post, _reason, severity = pipeline._should_post_slack(None, _alert(pod="postgres-0"), False)
+    assert severity == "warning"
+
+
+def _crash(severity="critical"):
+    return ScanResult(
+        state_key="Deployment:production/svc:crash",
+        title="Pod Issue: CrashLoopBackOff",
+        severity=severity,
+        resource="Pod/svc-abc",
+        namespace="production",
+        issue_type="crash",
+        pod_name="svc-abc",
+    )
+
+
 def test_without_the_flag_the_model_still_decides():
-    """The control: without it the two tests above could pass on a gate that
-    never read the analysis at all."""
+    """The control: without it the tests above could pass on a gate that never
+    read the analysis at all."""
     _post, _reason, severity = pipeline._should_post_slack(
-        _analysis("critical"), _alert(never_promote=False), False)
+        _analysis({"severity": "warning"}), _crash("critical"), False)
+    assert severity == "warning"
+
+
+def test_a_reply_without_severity_keeps_the_scanners():
+    import json
+    from src.engine.llm import parse_analysis
+    parsed, error = parse_analysis(json.dumps({"root_cause": "x", "confidence": 0.9}))
+    assert not error
+    _post, _reason, severity = pipeline._should_post_slack(
+        _analysis(parsed), _crash("critical"), False)
+    assert severity == "critical"
+
+
+def test_a_reply_that_failed_to_parse_keeps_the_scanners():
+    from src.engine.llm import parse_analysis
+    parsed, error = parse_analysis("not json")
+    assert error
+    _post, _reason, severity = pipeline._should_post_slack(
+        _analysis(parsed, parse_error=True), _crash("critical"), False)
     assert severity == "critical"
