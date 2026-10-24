@@ -276,6 +276,9 @@ def process_scan_results(results: list, store: SqliteStore,
         collective.resource = f"multiple ({len(res_list)})"
         collective.issue_type = "collective_incident"
         collective.severity = "warning"  # LLM will re-evaluate
+        # The batch is not the alert it was copied from: a Prometheus alert's
+        # final severity (never_promote) would keep the model from re-evaluating it.
+        collective.never_promote = False
         # Stable state_key for the batch to allow deduplication via cooldown
         collective.state_key = f"Collective:{ns}"
 

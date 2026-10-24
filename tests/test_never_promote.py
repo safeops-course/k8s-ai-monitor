@@ -269,3 +269,21 @@ def test_a_reply_that_failed_to_parse_keeps_the_scanners():
     _post, _reason, severity = pipeline._should_post_slack(
         _analysis(parsed, parse_error=True), _crash("critical"), False)
     assert severity == "critical"
+
+
+def test_a_batch_of_alerts_is_not_final(tmp_path, monkeypatch):
+    """Five alerts in one namespace become one collective incident, copied from
+    the first. The batch is not that alert: it must not inherit its final
+    severity, or the net-new rule could not raise it like any other batch."""
+    from src.handlers.alertmanager import alert_to_result
+    monkeypatch.setattr(config, "MASS_EVENT_THRESHOLD", 5)
+    store = SqliteStore(str(tmp_path / "batch.db"))
+    alerts = [alert_to_result({
+        "status": "firing", "fingerprint": f"f{i}",
+        "labels": {"alertname": f"Alert{i}", "namespace": "production", "severity": "warning"},
+        "annotations": {},
+    }) for i in range(5)]
+    assert all(a.never_promote for a in alerts)
+    with patch("src.engine.pipeline.llm_configured", return_value=False):
+        _run(alerts, store)
+    assert _severity(store, "Collective:production") == "critical"
