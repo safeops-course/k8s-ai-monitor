@@ -131,7 +131,7 @@ class TestParseAnalysisErrors(unittest.TestCase):
         raw = json.dumps({"root_cause": "minimal"})
         parsed, _ = parse_analysis(raw)
         self.assertEqual(parsed["confidence"], 0.3)
-        self.assertEqual(parsed["severity"], "warning")
+        self.assertNotIn("severity", parsed)   # never a default: the gate would read it as the model's
         self.assertEqual(parsed["impact"], "unknown")
         self.assertEqual(parsed["hypotheses"], [])
         self.assertEqual(parsed["suggested_actions"], [])

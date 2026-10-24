@@ -515,7 +515,6 @@ def _collect_24h_history() -> dict:
                             "reasoning": parsed.get("reasoning", ""),
                             "root_cause": parsed.get("root_cause", ""),
                             "confidence": parsed.get("confidence"),
-                            "severity": parsed.get("severity"),
                             "hypotheses": (parsed.get("hypotheses") or [])[:3],
                             "impact": parsed.get("impact", ""),
                             "suggested_actions": (parsed.get("suggested_actions") or [])[:3],
